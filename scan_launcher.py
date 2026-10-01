@@ -44,6 +44,14 @@ class _Signal:
         self.kind = kind
 
 
+class _Finding:
+    """A structured finding pushed through the output queue to be collected
+    on the main thread (keeps self._findings single-threaded)."""
+
+    def __init__(self, data: dict) -> None:
+        self.data = data
+
+
 # Matches ANSI/VT100 escape sequences (colors, cursor moves) that CLI tools
 # like nuclei emit; Tkinter's Text widget shows them as literal junk.
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
@@ -89,6 +97,31 @@ SECURITY_HEADERS = {
 
 _UA = {"User-Agent": "FSSA-Scan-Launcher/1.0"}
 
+# nuclei prints findings as: [template-id] [protocol] [severity] target ...
+_NUCLEI_LINE_RE = re.compile(
+    r"^\[([^\]]+)\] \[([^\]]+)\] \[(critical|high|medium|low|info|unknown)\] (.+)$"
+)
+
+
+def parse_tool_line(source: str, line: str) -> Optional[dict]:
+    """Turn a single nuclei/nikto output line into a finding dict, or None."""
+    s = line.strip()
+    if source == "nuclei":
+        m = _NUCLEI_LINE_RE.match(s)
+        if m:
+            return {
+                "source": "nuclei",
+                "severity": m.group(3),
+                "template": m.group(1),
+                "protocol": m.group(2),
+                "target": m.group(4),
+            }
+    elif source == "nikto":
+        # nikto itemizes findings with a leading "+ ".
+        if line.startswith("+ "):
+            return {"source": "nikto", "severity": "info", "detail": line[2:].strip()}
+    return None
+
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     """Opener handler that turns redirects into HTTPError instead of following
@@ -113,7 +146,7 @@ def _probe_path(base_url: str, path: str, timeout: float = 10.0) -> tuple:
         return path, None, 0, str(exc)
 
 
-def data_exposure_scan(base_url: str, log, cancel: threading.Event) -> None:
+def data_exposure_scan(base_url: str, log, cancel: threading.Event, record=None) -> None:
     """Flag sensitive paths that return 200 OK (exposed server files)."""
     log(f"[data-exposure] probing {len(SENSITIVE_PATHS)} paths on {base_url}")
     flagged = 0
@@ -131,6 +164,12 @@ def data_exposure_scan(base_url: str, log, cancel: threading.Event) -> None:
             elif status == 200:
                 flagged += 1
                 log(f"  [WARN] {path} -> 200 OK ({size}+ bytes) — POSSIBLY EXPOSED")
+                if record:
+                    record({
+                        "source": "data_exposure", "severity": "medium",
+                        "path": path, "status": status,
+                        "title": f"Exposed file {path}",
+                    })
             else:
                 log(f"  [ ok ] {path} -> {status}")
     log(f"[data-exposure] done — {flagged} path(s) flagged as possibly exposed.")
@@ -159,7 +198,7 @@ def _header_quality(name: str, value: str) -> str:
     return ""
 
 
-def security_header_audit(url: str, log, cancel: threading.Event) -> None:
+def security_header_audit(url: str, log, cancel: threading.Event, record=None) -> None:
     """Fetch the target and report presence/validity of protection headers."""
     log(f"[headers] fetching {url}")
     try:
@@ -181,9 +220,21 @@ def security_header_audit(url: str, log, cancel: threading.Event) -> None:
         value = headers.get(header.lower())
         if value:
             present += 1
-            log(f"  [ ok ] {header}: {value}{_header_quality(header, value)}")
+            note = _header_quality(header, value)
+            log(f"  [ ok ] {header}: {value}{note}")
+            if note and record:
+                record({
+                    "source": "headers", "type": "weak", "severity": "low",
+                    "header": header, "note": note.strip(" ()"),
+                    "title": f"Weak header {header}",
+                })
         else:
             log(f"  [GAP ] {header} — MISSING ({why})")
+            if record:
+                record({
+                    "source": "headers", "type": "missing", "severity": "low",
+                    "header": header, "title": f"Missing header {header}",
+                })
     total = len(SECURITY_HEADERS)
     log(f"[headers] gap analysis: {present}/{total} present, {total - present} missing.")
 
@@ -365,6 +416,7 @@ def api_schema_validator(
     routes: Optional[list[tuple[str, str]]],
     log,
     cancel: threading.Event,
+    record=None,
     max_endpoints: int = 25,
     max_requests: int = 300,
 ) -> None:
@@ -411,6 +463,13 @@ def api_schema_validator(
                 log(f"    [WARN] [{desc}] -> {status}  LEAK: {tag}")
                 if line:
                     log(f"           ↳ {line}")
+                if record:
+                    record({
+                        "source": "api", "severity": "high",
+                        "method": method, "path": cpath, "variant": desc,
+                        "status": status, "leak": tag, "detail": line,
+                        "title": f"{method} {path} leaks {tag}",
+                    })
     if cancel.is_set():
         log("[api-fuzz] cancelled.")
     log(f"[api-fuzz] done — {sent} request(s) sent, {flagged} leaking response(s).")
@@ -508,6 +567,7 @@ class ScanLauncher(tk.Tk):
         self._scan_running = False
         self._installing = False
         self._cancel = threading.Event()  # cooperative stop for Python tasks
+        self._findings: list[dict] = []   # live structured findings (main thread)
 
         self._build_ui()
         # Apply any user config overrides (paths, headers, signatures, …).
@@ -682,6 +742,9 @@ class ScanLauncher(tk.Tk):
         ttk.Button(control, text="Save report…", command=self.save_report).pack(
             side="left", padx=(6, 0)
         )
+        ttk.Button(control, text="Clear findings", command=self.clear_findings).pack(
+            side="left", padx=(6, 0)
+        )
         self.install_btn = ttk.Button(
             control, text="Install / update tools", command=self.install_tools
         )
@@ -692,6 +755,8 @@ class ScanLauncher(tk.Tk):
 
         self.status_var = tk.StringVar(value="Idle.")
         ttk.Label(control, textvariable=self.status_var).pack(side="right")
+        self.findings_var = tk.StringVar(value="Findings: 0")
+        ttk.Label(control, textvariable=self.findings_var).pack(side="right", padx=(0, 12))
 
         # --- Output pane ---------------------------------------------------
         out_frame = ttk.LabelFrame(self, text="Output")
@@ -759,7 +824,7 @@ class ScanLauncher(tk.Tk):
             tags = ",".join(t.strip() for t in tags.split(",") if t.strip())
             args += ["-tags", tags]
 
-        self._start(args, label="nuclei")
+        self._start(args, label="nuclei", source="nuclei")
 
     def run_nikto(self) -> None:
         if self._busy():
@@ -771,7 +836,7 @@ class ScanLauncher(tk.Tk):
         if cmd is None:
             self._offer_install(["nikto"])
             return
-        self._start(cmd + ["-h", url], label="nikto")
+        self._start(cmd + ["-h", url], label="nikto", source="nikto")
 
     def run_custom_script(self) -> None:
         if self._busy():
@@ -801,7 +866,7 @@ class ScanLauncher(tk.Tk):
         if not url:
             return
         self._start_task(
-            lambda log, cancel: data_exposure_scan(url, log, cancel),
+            lambda log, cancel: data_exposure_scan(url, log, cancel, record=self._record),
             label="data exposure scan",
         )
 
@@ -812,7 +877,7 @@ class ScanLauncher(tk.Tk):
         if not url:
             return
         self._start_task(
-            lambda log, cancel: security_header_audit(url, log, cancel),
+            lambda log, cancel: security_header_audit(url, log, cancel, record=self._record),
             label="security header audit",
         )
 
@@ -824,10 +889,10 @@ class ScanLauncher(tk.Tk):
             return
 
         def both(log, cancel) -> None:
-            security_header_audit(url, log, cancel)
+            security_header_audit(url, log, cancel, record=self._record)
             if not cancel.is_set():
                 log("")
-                data_exposure_scan(url, log, cancel)
+                data_exposure_scan(url, log, cancel, record=self._record)
 
         self._start_task(both, label="compliance audits")
 
@@ -842,7 +907,7 @@ class ScanLauncher(tk.Tk):
         routes = parse_api_routes(routes_text) if routes_text else None
         self._start_task(
             lambda log, cancel: api_schema_validator(
-                url, openapi_src, routes, log, cancel
+                url, openapi_src, routes, log, cancel, record=self._record
             ),
             label="API schema validation",
         )
@@ -882,7 +947,7 @@ class ScanLauncher(tk.Tk):
 
     # ---------------------------------------------- subprocess plumbing ---
 
-    def _start(self, cmd: list[str], label: str) -> None:
+    def _start(self, cmd: list[str], label: str, source: str | None = None) -> None:
         self._append(f"\n$ {' '.join(shlex.quote(c) for c in cmd)}\n")
         self.status_var.set(f"Running {label}…")
         self._scan_running = True
@@ -917,12 +982,24 @@ class ScanLauncher(tk.Tk):
 
             assert self._proc.stdout is not None
             fd = self._proc.stdout.fileno()
+            line_buf = ""  # accumulate complete lines for finding detection
             while True:
                 data = os.read(fd, 4096)
                 if not data:
                     break
                 text = data.decode("utf-8", "replace").replace("\r\n", "\n").replace("\r", "\n")
                 self._output_q.put(text)
+                if source:
+                    line_buf += text
+                    while "\n" in line_buf:
+                        line, line_buf = line_buf.split("\n", 1)
+                        found = parse_tool_line(source, line)
+                        if found:
+                            self._output_q.put(_Finding(found))
+            if source and line_buf.strip():
+                found = parse_tool_line(source, line_buf)
+                if found:
+                    self._output_q.put(_Finding(found))
             self._proc.wait()
             self._output_q.put(f"\n[{label} finished, exit code {self._proc.returncode}]\n")
             self._output_q.put(_Signal("scan_done"))
@@ -1010,6 +1087,9 @@ class ScanLauncher(tk.Tk):
                         self.status_var.set("Idle.")
                         self._refresh_tool_status()
                     self._update_buttons()
+                elif isinstance(item, _Finding):
+                    self._findings.append(item.data)
+                    self._update_findings_count()
                 else:
                     self._append(item)
         except queue.Empty:
@@ -1032,6 +1112,20 @@ class ScanLauncher(tk.Tk):
         ):
             btn.configure(state=state)
         self.stop_btn.configure(state="normal" if self._scan_running else "disabled")
+
+    # ---------------------------------------------------- findings (live) ---
+
+    def _record(self, finding: dict) -> None:
+        """Thread-safe: enqueue a finding to be collected on the main thread."""
+        self._output_q.put(_Finding(finding))
+
+    def _update_findings_count(self) -> None:
+        self.findings_var.set(f"Findings: {len(self._findings)}")
+
+    def clear_findings(self) -> None:
+        self._findings.clear()
+        self._update_findings_count()
+        self.status_var.set("Findings cleared.")
 
     # -------------------------------------------------------- scripts UI ---
 
@@ -1083,68 +1177,23 @@ class ScanLauncher(tk.Tk):
     # --------------------------------------------------- findings report ---
 
     def _collect_findings(self) -> dict:
-        """Parse the output pane into structured findings across all tools."""
-        text = self.output.get("1.0", "end")
-        data_exposure: list[dict] = []
-        headers_missing: list[str] = []
-        headers_weak: list[dict] = []
-        api: list[dict] = []
-        nuclei: list[dict] = []
-        nikto: list[str] = []
-
-        nuclei_re = re.compile(
-            r"^\[([^\]]+)\] \[([^\]]+)\] \[(critical|high|medium|low|info|unknown)\] (.+)$"
-        )
-        last_api: dict | None = None
-        for raw in text.splitlines():
-            line = raw.rstrip()
-            t = line.strip()
-
-            m = re.search(r"\[WARN\]\s+(\S+)\s+->\s+(\d+)\s+OK", t)
-            if m and "EXPOSED" in t:
-                data_exposure.append({"path": m.group(1), "status": int(m.group(2))})
-                continue
-            m = re.search(r"\[GAP \]\s+([\w-]+)", t)
-            if m:
-                headers_missing.append(m.group(1))
-                continue
-            m = re.search(r"\[ ok \]\s+([\w-]+):.*\(weak:(.*?)\)", t)
-            if m:
-                headers_weak.append({"header": m.group(1), "note": m.group(2).strip()})
-                continue
-            m = re.search(r"\[WARN\] \[([^\]]+)\] -> (\S+)\s+LEAK: (\S+)", t)
-            if m:
-                last_api = {
-                    "variant": m.group(1), "status": m.group(2),
-                    "leak": m.group(3), "detail": "",
-                }
-                api.append(last_api)
-                continue
-            if t.startswith("↳") and last_api is not None:
-                last_api["detail"] = t.lstrip("↳ ").strip()
-                last_api = None
-                continue
-            m = nuclei_re.match(t)
-            if m:
-                nuclei.append({
-                    "template": m.group(1), "protocol": m.group(2),
-                    "severity": m.group(3), "target": m.group(4),
-                })
-                continue
-            if line.startswith("+ "):
-                nikto.append(line[2:].strip())
-
-        total = (len(data_exposure) + len(headers_missing) + len(headers_weak)
-                 + len(api) + len(nuclei) + len(nikto))
+        """Aggregate the live findings list into a report structure."""
+        by = {s: [f for f in self._findings if f.get("source") == s]
+              for s in ("nuclei", "nikto", "data_exposure", "headers", "api")}
+        headers = {
+            "missing": [f["header"] for f in by["headers"] if f.get("type") == "missing"],
+            "weak": [{"header": f["header"], "note": f.get("note", "")}
+                     for f in by["headers"] if f.get("type") == "weak"],
+        }
         return {
             "target": self.url_var.get().strip(),
             "generated": datetime.now().isoformat(timespec="seconds"),
-            "total_findings": total,
-            "nuclei": nuclei,
-            "nikto": nikto,
-            "data_exposure": data_exposure,
-            "security_headers": {"missing": headers_missing, "weak": headers_weak},
-            "api_schema": api,
+            "total_findings": len(self._findings),
+            "nuclei": by["nuclei"],
+            "nikto": by["nikto"],
+            "data_exposure": by["data_exposure"],
+            "security_headers": headers,
+            "api_schema": by["api"],
         }
 
     @staticmethod
@@ -1167,7 +1216,7 @@ class ScanLauncher(tk.Tk):
             out.append("")
         if f["nikto"]:
             out.append(f"## nikto ({len(f['nikto'])})")
-            out += [f"- {line}" for line in f["nikto"]]
+            out += [f"- {item['detail']}" for item in f["nikto"]]
             out.append("")
         if f["data_exposure"]:
             out.append(f"## Data exposure ({len(f['data_exposure'])})")

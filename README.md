@@ -92,11 +92,17 @@ a sign of improper input handling.
 
 ## Findings report
 
-Click **Save report…** to export a consolidated findings report parsed from the
-current output window — spanning nuclei, nikto, the data-exposure scan, the
-security-header audit, and the API schema validator. Choose a `.md` filename for
-a Markdown report or `.json` for structured JSON (pick the extension in the save
-dialog). **Save output…** still saves the full raw log separately.
+Findings are collected **live** as tools run — each scanner records structured
+findings into a running list shown as **Findings: N** in the control row. This
+is independent of the output log, so **Clear output** does not discard findings
+and results **accumulate across multiple scans** in a session.
+
+- **Save report…** exports the collected findings spanning nuclei, nikto, the
+  data-exposure scan, the security-header audit, and the API schema validator.
+  Choose a `.md` filename for Markdown or `.json` for structured JSON (pick the
+  extension in the save dialog).
+- **Clear findings** resets the collected list (separate from Clear output).
+- **Save output…** still saves the full raw log separately.
 
 ## Configuration file
 
