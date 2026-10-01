@@ -146,6 +146,35 @@ Each lesser identity is compared to the reference per endpoint:
 The report includes a per-identity **matrix table** (rows = endpoints, columns =
 identities, cells = status) plus the individual findings, at the top.
 
+### Horizontal IDOR (object-level access)
+
+To catch horizontal access — one user reading another user's object — give each
+identity its own object IDs with `@param=value` lines in its block, where
+`param` matches a `{param}` placeholder in the route:
+
+```
+[userA]
+Cookie: session=aaa
+@id=1001
+[userB]
+Cookie: session=bbb
+@id=1002
+```
+
+Click **Run horizontal IDOR**. For each templated route (e.g.
+`GET /api/profile/{id}`) and each attacker→victim pair, the engine first
+confirms the victim can read their own object, then sends the **attacker's**
+authenticated request with the **victim's** object ID swapped in:
+
+- **critical — `horizontal-idor`:** the attacker gets the victim's object data.
+- **medium — `cross-access-differs`:** the attacker gets a `2xx` but different
+  content — review.
+- **not flagged — `enforced`:** the attacker gets `401/403/404`.
+
+Findings appear in a **Horizontal access / IDOR** section at the top of the
+report. (Needs routes with a `{param}` placeholder and `@param` IDs on at least
+two identities.)
+
 > Architecture: shared HTTP primitives live in `probecore.py`; the matrix engine
 > is `accessmatrix.py`; `scan_launcher.py` is the GUI
 > (`probecore ← accessmatrix ← scan_launcher`).

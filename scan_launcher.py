@@ -645,9 +645,11 @@ class ScanLauncher(tk.Tk):
         ttk.Label(
             matrix,
             justify="left",
-            text=("[name] block per identity,\nheaders/cookies on following lines.\n"
-                  "List most-privileged FIRST (reference).\n"
-                  "e.g.\n[admin]\nAuthorization: Bearer A\n[user]\nCookie: session=B"),
+            text=("[name] block per identity, most-privileged FIRST.\n"
+                  "Headers/cookies on following lines; @param=id lines\n"
+                  "give per-identity object IDs for the IDOR test. e.g.\n"
+                  "[admin]\nAuthorization: Bearer A\n[userA]\nCookie: s=B\n@id=1001\n"
+                  "[userB]\nCookie: s=C\n@id=1002"),
         ).grid(row=0, column=2, padx=6, pady=4, sticky="w")
 
         self.include_anon_var = tk.BooleanVar(value=True)
@@ -655,12 +657,21 @@ class ScanLauncher(tk.Tk):
             matrix, text="Include anonymous (simulate unauthenticated user)",
             variable=self.include_anon_var,
         ).grid(row=1, column=1, sticky="w", padx=6)
+
+        matrix_btns = ttk.Frame(matrix)
+        matrix_btns.grid(row=2, column=1, sticky="w", padx=6, pady=6)
         self.matrix_btn = ttk.Button(
-            matrix, text="Run access-control matrix", command=self.run_access_matrix
+            matrix_btns, text="Run access-control matrix", command=self.run_access_matrix
         )
-        self.matrix_btn.grid(row=2, column=1, sticky="w", padx=6, pady=6)
+        self.matrix_btn.pack(side="left")
+        self.idor_btn = ttk.Button(
+            matrix_btns, text="Run horizontal IDOR", command=self.run_idor_matrix
+        )
+        self.idor_btn.pack(side="left", padx=(6, 0))
+
         ttk.Label(
-            matrix, text="Uses the OpenAPI/custom-routes\nfields above for endpoints.",
+            matrix, text="Endpoints come from the\nOpenAPI/custom-routes fields.\n"
+                         "IDOR needs {id} routes + @ids.",
             justify="left",
         ).grid(row=1, column=2, rowspan=2, padx=6, pady=4, sticky="w")
         matrix.columnconfigure(1, weight=1)
@@ -929,6 +940,38 @@ class ScanLauncher(tk.Tk):
 
         self._start_task(task, label="access-control matrix")
 
+    def run_idor_matrix(self) -> None:
+        if self._busy():
+            return
+        url = self._valid_target()
+        if not url:
+            return
+        # Anonymous has no objects, so exclude it from the IDOR identity set.
+        identities = am.parse_identities(
+            self.identities_text.get("1.0", "end"), include_anon=False
+        )
+        owners = [i for i in identities if i.get("objects")]
+        if len(owners) < 2:
+            messagebox.showwarning(
+                "Object IDs required",
+                "Horizontal IDOR needs at least two identities with per-identity "
+                "object IDs. Add '@param=value' lines to each identity block, e.g.\n"
+                "[userA]\nCookie: session=aaa\n@id=1001",
+            )
+            return
+        openapi_src = self.openapi_var.get().strip() or None
+        routes_text = self.routes_text.get("1.0", "end").strip()
+        routes = parse_api_routes(routes_text) if routes_text else None
+        reference_headers = identities[0]["headers"]
+
+        def task(log, cancel) -> None:
+            endpoints = am.resolve_endpoints(
+                url, openapi_src, routes, reference_headers, SENSITIVE_PATHS, log
+            )
+            am.run_idor(url, endpoints, identities, log, cancel, record=self._record)
+
+        self._start_task(task, label="horizontal IDOR")
+
     def _start_task(self, target, label: str) -> None:
         """Run a pure-Python check in a background thread, streaming via log."""
         self._append(f"\n=== {label} ===\n")
@@ -1136,6 +1179,7 @@ class ScanLauncher(tk.Tk):
             self.audit_all_btn,
             self.api_validate_btn,
             self.matrix_btn,
+            self.idor_btn,
         ):
             btn.configure(state=state)
         self.stop_btn.configure(state="normal" if self._scan_running else "disabled")
@@ -1207,7 +1251,7 @@ class ScanLauncher(tk.Tk):
         """Aggregate the live findings list into a report structure."""
         by = {s: [f for f in self._findings if f.get("source") == s]
               for s in ("nuclei", "nikto", "data_exposure", "headers", "api",
-                        "access_matrix", "access_matrix_grid")}
+                        "access_matrix", "access_matrix_grid", "idor")}
         headers = {
             "missing": [f["header"] for f in by["headers"] if f.get("type") == "missing"],
             "weak": [{"header": f["header"], "note": f.get("note", "")}
@@ -1226,6 +1270,7 @@ class ScanLauncher(tk.Tk):
             "api_schema": by["api"],
             "access_matrix": by["access_matrix"],
             "access_matrix_grid": by["access_matrix_grid"],
+            "idor": by["idor"],
         }
 
     @staticmethod
@@ -1238,6 +1283,16 @@ class ScanLauncher(tk.Tk):
             f"- **Total findings:** {f['total_findings']}",
             "",
         ]
+        if f.get("idor"):
+            out.append(f"## Horizontal access / IDOR ({len(f['idor'])})")
+            for a in f["idor"]:
+                out.append(
+                    f"- **[{a['severity']}]** `{a['method']} {a['path']}` — "
+                    f"{a['attacker']} read {a['victim']}'s {a['param']}="
+                    f"{a['object_id']} ({a['verdict']}; "
+                    f"{a['attacker']}={a['attacker_status']})"
+                )
+            out.append("")
         if f.get("access_matrix"):
             out.append(f"## Access control ({len(f['access_matrix'])})")
             for a in f["access_matrix"]:
