@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import queue
+import re
 import shlex
 import signal
 import subprocess
@@ -37,6 +38,11 @@ class _Signal:
 
     def __init__(self, kind: str) -> None:
         self.kind = kind
+
+
+# Matches ANSI/VT100 escape sequences (colors, cursor moves) that CLI tools
+# like nuclei emit; Tkinter's Text widget shows them as literal junk.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 
 
 # Directory that holds your custom internal scripts. Override with the
@@ -270,12 +276,14 @@ class ScanLauncher(tk.Tk):
 
         def worker() -> None:
             try:
+                # Binary pipe + os.read streams output as soon as it arrives,
+                # so in-place progress (carriage returns, e.g. nuclei's
+                # template download) shows up live instead of looking frozen.
                 self._proc = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
-                    text=True,
-                    bufsize=1,
+                    bufsize=0,
                     env=env,
                     **group_kwargs,
                 )
@@ -285,8 +293,13 @@ class ScanLauncher(tk.Tk):
                 return
 
             assert self._proc.stdout is not None
-            for line in self._proc.stdout:
-                self._output_q.put(line)
+            fd = self._proc.stdout.fileno()
+            while True:
+                data = os.read(fd, 4096)
+                if not data:
+                    break
+                text = data.decode("utf-8", "replace").replace("\r\n", "\n").replace("\r", "\n")
+                self._output_q.put(text)
             self._proc.wait()
             self._output_q.put(f"\n[{label} finished, exit code {self._proc.returncode}]\n")
             self._output_q.put(_Signal("scan_done"))
@@ -414,6 +427,7 @@ class ScanLauncher(tk.Tk):
     # --------------------------------------------------------- output IO ---
 
     def _append(self, text: str) -> None:
+        text = _ANSI_RE.sub("", text)
         self.output.configure(state="normal")
         self.output.insert("end", text)
         self.output.see("end")
