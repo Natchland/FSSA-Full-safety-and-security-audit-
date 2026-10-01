@@ -50,6 +50,24 @@ py scan_launcher.py          # Windows
 Narrowing severity and/or tags makes scans much faster and quieter — useful
 against WAF/CDN-fronted hosts where the full 10k+ template set is overkill.
 
+## Compliance & Data Exposure Audits (passive)
+
+Built-in, dependency-free checks that run in-process and stream into the same
+output window. They send only plain GET requests — no payloads, no
+exploitation — and honor the authorization checkbox and the Stop button.
+
+- **Data exposure scan** — concurrently probes a small, standard list of
+  administrative/backup paths (`/.git/HEAD`, `/.env`, `/config.bak`,
+  `/backup.sql`, …) relative to the target and flags any that return
+  `200 OK`. Redirects are not followed, so a 301/302 to a login page is not
+  mistaken for an exposed file. (200s can still be soft-404s — verify flagged
+  paths manually.)
+- **Security header audit** — inspects the target's response headers and does a
+  gap analysis of key data-protection headers (HSTS, Content-Security-Policy,
+  X-Frame-Options, X-Content-Type-Options, Referrer-Policy, Permissions-Policy),
+  including basic validity notes (e.g. HSTS `max-age=0`, CSP `unsafe-inline`).
+- **Run both audits** — runs the header audit then the data exposure scan.
+
 ## Automatic tool installation
 
 On launch, the app checks for `nuclei` and `nikto`. If either is missing it

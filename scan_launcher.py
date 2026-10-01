@@ -23,9 +23,12 @@ import signal
 import subprocess
 import sys
 import threading
+import urllib.error
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -43,6 +46,145 @@ class _Signal:
 # Matches ANSI/VT100 escape sequences (colors, cursor moves) that CLI tools
 # like nuclei emit; Tkinter's Text widget shows them as literal junk.
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+
+
+# =====================================================================
+# Passive compliance / data-exposure checks (pure Python, stdlib only)
+# ---------------------------------------------------------------------
+# Both functions take a ``log(str)`` callable and a ``threading.Event``
+# used for cooperative cancellation (the Stop button). They only send
+# plain GET requests — no exploitation, no payloads.
+# =====================================================================
+
+# A small, standard list of administrative / backup paths that should not
+# be publicly readable on a production server.
+SENSITIVE_PATHS = [
+    "/.git/HEAD",
+    "/.git/config",
+    "/.env",
+    "/.htaccess",
+    "/.DS_Store",
+    "/config.bak",
+    "/config.php.bak",
+    "/wp-config.php.bak",
+    "/backup.sql",
+    "/backup.zip",
+    "/db.sql",
+    "/dump.sql",
+    "/phpinfo.php",
+    "/server-status",
+]
+
+# Response headers reviewed by the security-header auditor, with why each
+# one matters for data protection / compliance.
+SECURITY_HEADERS = {
+    "Strict-Transport-Security": "HSTS — forces HTTPS, prevents downgrade",
+    "Content-Security-Policy": "CSP — mitigates XSS / content injection",
+    "X-Frame-Options": "clickjacking protection",
+    "X-Content-Type-Options": "blocks MIME-type sniffing",
+    "Referrer-Policy": "controls referrer leakage",
+    "Permissions-Policy": "restricts powerful browser features",
+}
+
+_UA = {"User-Agent": "FSSA-Scan-Launcher/1.0"}
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Opener handler that turns redirects into HTTPError instead of following
+    them, so a 301/302 to a login page is not mistaken for an exposed file."""
+
+    def redirect_request(self, *args, **kwargs):  # noqa: ANN002, ANN003, D401
+        return None
+
+
+def _probe_path(base_url: str, path: str, timeout: float = 10.0) -> tuple:
+    """GET base_url+path (no redirects). Returns (path, status, size, error)."""
+    url = urljoin(base_url, path)
+    req = urllib.request.Request(url, method="GET", headers=_UA)
+    opener = urllib.request.build_opener(_NoRedirect)
+    try:
+        with opener.open(req, timeout=timeout) as resp:
+            body = resp.read(2048)  # enough to gauge a real response
+            return path, resp.status, len(body), None
+    except urllib.error.HTTPError as exc:
+        return path, exc.code, 0, None
+    except Exception as exc:  # noqa: BLE001 - report any transport failure
+        return path, None, 0, str(exc)
+
+
+def data_exposure_scan(base_url: str, log, cancel: threading.Event) -> None:
+    """Flag sensitive paths that return 200 OK (exposed server files)."""
+    log(f"[data-exposure] probing {len(SENSITIVE_PATHS)} paths on {base_url}")
+    flagged = 0
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {
+            pool.submit(_probe_path, base_url, p): p for p in SENSITIVE_PATHS
+        }
+        for future in as_completed(futures):
+            if cancel.is_set():
+                log("[data-exposure] cancelled.")
+                break
+            path, status, size, error = future.result()
+            if error:
+                log(f"  [err ] {path} — {error}")
+            elif status == 200:
+                flagged += 1
+                log(f"  [WARN] {path} -> 200 OK ({size}+ bytes) — POSSIBLY EXPOSED")
+            else:
+                log(f"  [ ok ] {path} -> {status}")
+    log(f"[data-exposure] done — {flagged} path(s) flagged as possibly exposed.")
+    if flagged:
+        log("[data-exposure] NOTE: verify manually; some servers return 200 "
+            "for soft-404 pages.")
+
+
+def _header_quality(name: str, value: str) -> str:
+    """Return a short validity note for a present header, or '' if fine."""
+    v = value.lower()
+    if name == "Strict-Transport-Security":
+        if "max-age=0" in v:
+            return "  (weak: max-age=0 disables HSTS)"
+        if "max-age" not in v:
+            return "  (weak: no max-age directive)"
+    elif name == "Content-Security-Policy":
+        if "unsafe-inline" in v:
+            return "  (weak: allows 'unsafe-inline')"
+    elif name == "X-Frame-Options":
+        if v not in ("deny", "sameorigin"):
+            return "  (unusual value; expected DENY or SAMEORIGIN)"
+    elif name == "X-Content-Type-Options":
+        if v != "nosniff":
+            return "  (expected 'nosniff')"
+    return ""
+
+
+def security_header_audit(url: str, log, cancel: threading.Event) -> None:
+    """Fetch the target and report presence/validity of protection headers."""
+    log(f"[headers] fetching {url}")
+    try:
+        req = urllib.request.Request(url, headers=_UA)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            headers = {k.lower(): v for k, v in resp.headers.items()}
+            status = resp.status
+            final_url = resp.geturl()
+    except Exception as exc:  # noqa: BLE001 - report any transport failure
+        log(f"[headers] request failed: {exc}")
+        return
+    if cancel.is_set():
+        log("[headers] cancelled.")
+        return
+
+    log(f"[headers] HTTP {status} (final URL: {final_url})")
+    present = 0
+    for header, why in SECURITY_HEADERS.items():
+        value = headers.get(header.lower())
+        if value:
+            present += 1
+            log(f"  [ ok ] {header}: {value}{_header_quality(header, value)}")
+        else:
+            log(f"  [GAP ] {header} — MISSING ({why})")
+    total = len(SECURITY_HEADERS)
+    log(f"[headers] gap analysis: {present}/{total} present, {total - present} missing.")
 
 
 # Directory that holds your custom internal scripts. Override with the
@@ -67,6 +209,7 @@ class ScanLauncher(tk.Tk):
         self._scripts_dir = DEFAULT_SCRIPTS_DIR
         self._scan_running = False
         self._installing = False
+        self._cancel = threading.Event()  # cooperative stop for Python tasks
 
         self._build_ui()
         self._refresh_tool_status()
@@ -139,6 +282,28 @@ class ScanLauncher(tk.Tk):
             opts, text="comma-separated, e.g. cves,misconfig (blank = all)"
         ).grid(row=1, column=4, padx=6, pady=4, sticky="w")
         opts.columnconfigure(3, weight=1)
+
+        # --- Compliance & data-exposure audits ----------------------------
+        audit = ttk.LabelFrame(self, text="Compliance & Data Exposure Audits (passive)")
+        audit.pack(fill="x", **pad)
+
+        self.data_exposure_btn = ttk.Button(
+            audit, text="Data exposure scan", command=self.run_data_exposure
+        )
+        self.data_exposure_btn.grid(row=0, column=0, sticky="ew", padx=6, pady=6)
+
+        self.header_audit_btn = ttk.Button(
+            audit, text="Security header audit", command=self.run_header_audit
+        )
+        self.header_audit_btn.grid(row=0, column=1, sticky="ew", padx=6, pady=6)
+
+        self.audit_all_btn = ttk.Button(
+            audit, text="Run both audits", command=self.run_all_audits
+        )
+        self.audit_all_btn.grid(row=0, column=2, sticky="ew", padx=6, pady=6)
+
+        for col in range(3):
+            audit.columnconfigure(col, weight=1)
 
         # --- Custom internal scripts --------------------------------------
         custom = ttk.LabelFrame(self, text="Custom internal scripts")
@@ -285,6 +450,66 @@ class ScanLauncher(tk.Tk):
         cmd = self._interpreter_for(script_path) + [str(script_path), url]
         self._start(cmd, label=f"custom:{name}")
 
+    # ------------------------------------------- compliance audits (py) ---
+
+    def run_data_exposure(self) -> None:
+        if self._busy():
+            return
+        url = self._valid_target()
+        if not url:
+            return
+        self._start_task(
+            lambda log, cancel: data_exposure_scan(url, log, cancel),
+            label="data exposure scan",
+        )
+
+    def run_header_audit(self) -> None:
+        if self._busy():
+            return
+        url = self._valid_target()
+        if not url:
+            return
+        self._start_task(
+            lambda log, cancel: security_header_audit(url, log, cancel),
+            label="security header audit",
+        )
+
+    def run_all_audits(self) -> None:
+        if self._busy():
+            return
+        url = self._valid_target()
+        if not url:
+            return
+
+        def both(log, cancel) -> None:
+            security_header_audit(url, log, cancel)
+            if not cancel.is_set():
+                log("")
+                data_exposure_scan(url, log, cancel)
+
+        self._start_task(both, label="compliance audits")
+
+    def _start_task(self, target, label: str) -> None:
+        """Run a pure-Python check in a background thread, streaming via log."""
+        self._append(f"\n=== {label} ===\n")
+        self.status_var.set(f"Running {label}…")
+        self._scan_running = True
+        self._cancel.clear()
+        self._update_buttons()
+
+        def log(line: str) -> None:
+            self._output_q.put(line + "\n")
+
+        def worker() -> None:
+            try:
+                target(log, self._cancel)
+            except Exception as exc:  # noqa: BLE001 - surface any failure
+                self._output_q.put(f"[error] {label} failed: {exc}\n")
+            self._output_q.put(f"[{label} finished]\n")
+            self._output_q.put(_Signal("scan_done"))
+
+        threading.Thread(target=worker, daemon=True).start()
+
     @staticmethod
     def _interpreter_for(path: Path) -> list[str]:
         suffix = path.suffix.lower()
@@ -303,6 +528,7 @@ class ScanLauncher(tk.Tk):
         self._append(f"\n$ {' '.join(shlex.quote(c) for c in cmd)}\n")
         self.status_var.set(f"Running {label}…")
         self._scan_running = True
+        self._cancel.clear()
         self._update_buttons()
 
         # Put the child in its own process group so Stop can kill the whole
@@ -346,20 +572,21 @@ class ScanLauncher(tk.Tk):
         threading.Thread(target=worker, daemon=True).start()
 
     def stop_scan(self) -> None:
+        # Signal cooperative cancellation for Python audit tasks.
+        self._cancel.set()
         proc = self._proc
-        if proc is None or proc.poll() is not None:
-            return
-        try:
-            # Kill the whole process tree so child scanners die too.
-            if os.name == "nt":
-                subprocess.run(
-                    ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                    capture_output=True,
-                )
-            else:
-                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-        except (ProcessLookupError, PermissionError, OSError):
-            proc.terminate()
+        if proc is not None and proc.poll() is None:
+            try:
+                # Kill the whole process tree so child scanners die too.
+                if os.name == "nt":
+                    subprocess.run(
+                        ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                        capture_output=True,
+                    )
+                else:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            except (ProcessLookupError, PermissionError, OSError):
+                proc.terminate()
         self._append("\n[stop requested]\n")
 
     # ------------------------------------------------------ tool install ---
@@ -435,7 +662,15 @@ class ScanLauncher(tk.Tk):
         """Enable/disable buttons based on scan + install state."""
         idle = not self._scan_running and not self._installing
         state = "normal" if idle else "disabled"
-        for btn in (self.nuclei_btn, self.nikto_btn, self.custom_btn, self.install_btn):
+        for btn in (
+            self.nuclei_btn,
+            self.nikto_btn,
+            self.custom_btn,
+            self.install_btn,
+            self.data_exposure_btn,
+            self.header_audit_btn,
+            self.audit_all_btn,
+        ):
             btn.configure(state=state)
         self.stop_btn.configure(state="normal" if self._scan_running else "disabled")
 
