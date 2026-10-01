@@ -39,6 +39,17 @@ py scan_launcher.py          # Windows
 2. Tick **"I am authorized to scan this target."**
 3. Click a scan button, or pick a custom script and click **Run script**.
 
+### nuclei options
+
+- **Severity** — tick which severities to run (`critical`/`high`/`medium` are
+  on by default to cut noise). Passes `-severity`. Untick all to run every
+  severity.
+- **Tags** — comma-separated template tags to restrict the scan, e.g.
+  `cves,misconfig`. Passes `-tags`. Leave blank to run all templates.
+
+Narrowing severity and/or tags makes scans much faster and quieter — useful
+against WAF/CDN-fronted hosts where the full 10k+ template set is overkill.
+
 ## Automatic tool installation
 
 On launch, the app checks for `nuclei` and `nikto`. If either is missing it

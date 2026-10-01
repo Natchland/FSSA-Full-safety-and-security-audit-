@@ -113,6 +113,33 @@ class ScanLauncher(tk.Tk):
         btns.columnconfigure(0, weight=1)
         btns.columnconfigure(1, weight=1)
 
+        # --- nuclei options -----------------------------------------------
+        opts = ttk.LabelFrame(self, text="nuclei options")
+        opts.pack(fill="x", **pad)
+
+        ttk.Label(opts, text="Severity:").grid(row=0, column=0, padx=6, pady=4, sticky="w")
+        sev_box = ttk.Frame(opts)
+        sev_box.grid(row=0, column=1, columnspan=4, sticky="w")
+        # Default to the noise-reducing high-signal set; untick for everything.
+        self.severity_vars: dict[str, tk.BooleanVar] = {}
+        defaults = {"critical", "high", "medium"}
+        for i, sev in enumerate(("critical", "high", "medium", "low", "info")):
+            var = tk.BooleanVar(value=sev in defaults)
+            self.severity_vars[sev] = var
+            ttk.Checkbutton(sev_box, text=sev, variable=var).grid(
+                row=0, column=i, padx=(0, 8)
+            )
+
+        ttk.Label(opts, text="Tags:").grid(row=1, column=0, padx=6, pady=4, sticky="w")
+        self.tags_var = tk.StringVar()
+        ttk.Entry(opts, textvariable=self.tags_var).grid(
+            row=1, column=1, columnspan=3, sticky="ew", padx=6, pady=4
+        )
+        ttk.Label(
+            opts, text="comma-separated, e.g. cves,misconfig (blank = all)"
+        ).grid(row=1, column=4, padx=6, pady=4, sticky="w")
+        opts.columnconfigure(3, weight=1)
+
         # --- Custom internal scripts --------------------------------------
         custom = ttk.LabelFrame(self, text="Custom internal scripts")
         custom.pack(fill="x", **pad)
@@ -213,7 +240,19 @@ class ScanLauncher(tk.Tk):
             self._offer_install(["nuclei"])
             return
         # Standard templates: nuclei ships them and auto-updates on first run.
-        self._start(cmd + ["-u", url], label="nuclei")
+        args = cmd + ["-u", url, "-nc"]  # -nc: no color (we also strip ANSI)
+
+        severities = [s for s, v in self.severity_vars.items() if v.get()]
+        if severities:
+            args += ["-severity", ",".join(severities)]
+
+        tags = self.tags_var.get().strip()
+        if tags:
+            # Normalize spacing: "cves, misconfig" -> "cves,misconfig"
+            tags = ",".join(t.strip() for t in tags.split(",") if t.strip())
+            args += ["-tags", tags]
+
+        self._start(args, label="nuclei")
 
     def run_nikto(self) -> None:
         if self._busy():
