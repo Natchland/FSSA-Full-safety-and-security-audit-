@@ -21,6 +21,7 @@ import shlex
 import shutil
 import signal
 import subprocess
+import sys
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -222,7 +223,9 @@ class ScanLauncher(tk.Tk):
     def _interpreter_for(path: Path) -> list[str]:
         suffix = path.suffix.lower()
         if suffix == ".py":
-            return ["python3"]
+            # Use the same interpreter running this GUI (works on Windows,
+            # where there is usually no "python3" command).
+            return [sys.executable]
         if suffix in (".sh", ".bash"):
             return ["bash"]
         # Fall back to executing the file directly (relies on its shebang).
@@ -235,6 +238,13 @@ class ScanLauncher(tk.Tk):
         self.status_var.set(f"Running {label}…")
         self._set_running(True)
 
+        # Put the child in its own process group so Stop can kill the whole
+        # tree. The mechanism differs between Windows and POSIX.
+        if os.name == "nt":
+            group_kwargs = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+        else:
+            group_kwargs = {"start_new_session": True}
+
         def worker() -> None:
             try:
                 self._proc = subprocess.Popen(
@@ -243,7 +253,7 @@ class ScanLauncher(tk.Tk):
                     stderr=subprocess.STDOUT,
                     text=True,
                     bufsize=1,
-                    start_new_session=True,  # own process group, for clean stop
+                    **group_kwargs,
                 )
             except OSError as exc:  # pragma: no cover - defensive
                 self._output_q.put(f"[error] could not start process: {exc}\n")
@@ -264,9 +274,15 @@ class ScanLauncher(tk.Tk):
         if proc is None or proc.poll() is not None:
             return
         try:
-            # Kill the whole process group so child scanners die too.
-            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-        except (ProcessLookupError, PermissionError):
+            # Kill the whole process tree so child scanners die too.
+            if os.name == "nt":
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                    capture_output=True,
+                )
+            else:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
             proc.terminate()
         self._append("\n[stop requested]\n")
 
