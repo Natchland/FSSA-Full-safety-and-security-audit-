@@ -212,6 +212,25 @@ edit any of these keys — each one present replaces that default:
 Config loads automatically on launch; use **Reload config** to re-apply after
 editing without restarting.
 
+## Rate Limiting & Resource Exhaustion Tester
+
+Checks whether an endpoint enforces rate limiting by sending a **bounded,
+concurrent burst** and watching for throttling. It is a control-presence check,
+not a flood: capped at 500 requests / 100 concurrent, single burst, gated by the
+authorization checkbox.
+
+- Set **Endpoint** (blank = Target URL; a bare path is resolved against it),
+  **Method**, **Requests**, and **Concurrency**, then click **Run rate-limit
+  test**. The session headers (if set) are included, so authenticated endpoints
+  can be tested too.
+- It reports the status-code distribution, timing (avg / p95 / max) and
+  throughput.
+- If the server throttles (`429`, or `503` + Retry-After), it reports rate
+  limiting as present.
+- If the server keeps returning `2xx` with **no 429**, it logs a **compliance
+  gap** — no automated rate-limiting control — recorded in the report's **Rate
+  limiting** section.
+
 ## Automatic tool installation
 
 On launch, the app checks for `nuclei` and `nikto`. If either is missing it

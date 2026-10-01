@@ -36,6 +36,7 @@ from tkinter import filedialog, messagebox, ttk
 
 import accessmatrix as am
 import probecore as pc
+import ratelimit as rl
 import toolmanager
 from probecore import parse_api_routes, parse_auth_headers  # re-exported helpers
 
@@ -676,6 +677,49 @@ class ScanLauncher(tk.Tk):
         ).grid(row=1, column=2, rowspan=2, padx=6, pady=4, sticky="w")
         matrix.columnconfigure(1, weight=1)
 
+        # --- Rate limiting / resource exhaustion --------------------------
+        rlf = ttk.LabelFrame(
+            self, text="Rate Limiting & Resource Exhaustion Tester (bounded burst)"
+        )
+        rlf.pack(fill="x", **pad)
+
+        ttk.Label(rlf, text="Endpoint:").grid(row=0, column=0, padx=6, pady=4, sticky="w")
+        self.rl_endpoint_var = tk.StringVar()
+        ttk.Entry(rlf, textvariable=self.rl_endpoint_var).grid(
+            row=0, column=1, columnspan=3, sticky="ew", padx=6, pady=4
+        )
+        ttk.Label(rlf, text="blank = Target URL").grid(
+            row=0, column=4, padx=6, pady=4, sticky="w"
+        )
+
+        ttk.Label(rlf, text="Method:").grid(row=1, column=0, padx=6, pady=4, sticky="w")
+        self.rl_method_var = tk.StringVar(value="GET")
+        ttk.Combobox(
+            rlf, textvariable=self.rl_method_var, width=8, state="readonly",
+            values=("GET", "POST", "PUT", "PATCH", "DELETE"),
+        ).grid(row=1, column=1, sticky="w", padx=6, pady=4)
+
+        ttk.Label(rlf, text="Requests:").grid(row=1, column=2, padx=6, pady=4, sticky="e")
+        self.rl_total_var = tk.IntVar(value=50)
+        ttk.Spinbox(rlf, from_=1, to=rl.MAX_TOTAL, textvariable=self.rl_total_var,
+                    width=7).grid(row=1, column=3, sticky="w", padx=6, pady=4)
+
+        ttk.Label(rlf, text="Concurrency:").grid(row=2, column=2, padx=6, pady=4, sticky="e")
+        self.rl_conc_var = tk.IntVar(value=20)
+        ttk.Spinbox(rlf, from_=1, to=rl.MAX_CONCURRENCY, textvariable=self.rl_conc_var,
+                    width=7).grid(row=2, column=3, sticky="w", padx=6, pady=4)
+
+        self.rl_btn = ttk.Button(
+            rlf, text="Run rate-limit test", command=self.run_rate_limit
+        )
+        self.rl_btn.grid(row=2, column=1, sticky="w", padx=6, pady=6)
+        ttk.Label(
+            rlf, justify="left",
+            text=f"Capped at {rl.MAX_TOTAL} requests /\n{rl.MAX_CONCURRENCY} concurrent.\n"
+                 "Uses the session headers above.",
+        ).grid(row=1, column=4, rowspan=2, padx=6, pady=4, sticky="w")
+        rlf.columnconfigure(1, weight=1)
+
         # --- Custom internal scripts --------------------------------------
         custom = ttk.LabelFrame(self, text="Custom internal scripts")
         custom.pack(fill="x", **pad)
@@ -972,6 +1016,33 @@ class ScanLauncher(tk.Tk):
 
         self._start_task(task, label="horizontal IDOR")
 
+    def run_rate_limit(self) -> None:
+        if self._busy():
+            return
+        url = self._valid_target()
+        if not url:
+            return
+        endpoint = self.rl_endpoint_var.get().strip() or url
+        if not endpoint.lower().startswith(("http://", "https://")):
+            # Treat a bare path as relative to the target.
+            from urllib.parse import urljoin as _urljoin
+            endpoint = _urljoin(url, endpoint)
+        method = self.rl_method_var.get()
+        try:
+            total = int(self.rl_total_var.get())
+            concurrency = int(self.rl_conc_var.get())
+        except (tk.TclError, ValueError):
+            messagebox.showerror("Invalid input", "Requests and Concurrency must be numbers.")
+            return
+        auth = self._auth_headers()
+        self._start_task(
+            lambda log, cancel: rl.rate_limit_test(
+                endpoint, method=method, total=total, concurrency=concurrency,
+                headers=auth or None, log=log, cancel=cancel, record=self._record
+            ),
+            label="rate-limit test",
+        )
+
     def _start_task(self, target, label: str) -> None:
         """Run a pure-Python check in a background thread, streaming via log."""
         self._append(f"\n=== {label} ===\n")
@@ -1180,6 +1251,7 @@ class ScanLauncher(tk.Tk):
             self.api_validate_btn,
             self.matrix_btn,
             self.idor_btn,
+            self.rl_btn,
         ):
             btn.configure(state=state)
         self.stop_btn.configure(state="normal" if self._scan_running else "disabled")
@@ -1251,7 +1323,7 @@ class ScanLauncher(tk.Tk):
         """Aggregate the live findings list into a report structure."""
         by = {s: [f for f in self._findings if f.get("source") == s]
               for s in ("nuclei", "nikto", "data_exposure", "headers", "api",
-                        "access_matrix", "access_matrix_grid", "idor")}
+                        "access_matrix", "access_matrix_grid", "idor", "rate_limit")}
         headers = {
             "missing": [f["header"] for f in by["headers"] if f.get("type") == "missing"],
             "weak": [{"header": f["header"], "note": f.get("note", "")}
@@ -1271,6 +1343,7 @@ class ScanLauncher(tk.Tk):
             "access_matrix": by["access_matrix"],
             "access_matrix_grid": by["access_matrix_grid"],
             "idor": by["idor"],
+            "rate_limit": by["rate_limit"],
         }
 
     @staticmethod
@@ -1343,6 +1416,16 @@ class ScanLauncher(tk.Tk):
                 out.append(f"- `{a['variant']}` → {a['status']} — {a['leak']}")
                 if a["detail"]:
                     out.append(f"  - {a['detail']}")
+            out.append("")
+        if f.get("rate_limit"):
+            out.append(f"## Rate limiting ({len(f['rate_limit'])})")
+            for r in f["rate_limit"]:
+                out.append(
+                    f"- **[{r['severity']}]** `{r['endpoint']}` — no 429 across "
+                    f"{r['requests']} requests ({r['ok_2xx']} × 2xx, "
+                    f"avg {r['avg_ms']} ms, {r['throughput_rps']} req/s): "
+                    "no automated rate-limiting control"
+                )
             out.append("")
         if f["total_findings"] == 0:
             out.append("_No findings parsed from the current output._")
