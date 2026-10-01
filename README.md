@@ -111,6 +111,24 @@ a sign of improper input handling.
 - **Bounded & cancellable:** capped at 25 endpoints / 300 requests by default,
   and the Stop button cancels it mid-run.
 
+### Access-control diff (Broken Access Control — OWASP A01)
+
+The highest-signal check for a report: it requests each endpoint **twice — with
+the session and without it** — and flags where authorization isn't actually
+enforced. Requires a session in the **Custom Session Headers/Cookies** field.
+
+- **critical — `identical-response`:** the endpoint returns the *same* response
+  with and without the session — the session is ignored, access control is
+  effectively absent.
+- **high — `anonymous-access`:** an anonymous caller still gets a `2xx` (with
+  different content) — the endpoint should have required auth.
+- **not flagged — `enforced`:** anonymous gets `401/403` while the session gets
+  `2xx` — working as intended.
+
+Endpoints come from the same OpenAPI/custom-routes inputs as the validator; with
+no spec it falls back to the sensitive-path list. Findings appear in a dedicated
+**Broken access control** section at the top of the report.
+
 ## Findings report
 
 Findings are collected **live** as tools run — each scanner records structured

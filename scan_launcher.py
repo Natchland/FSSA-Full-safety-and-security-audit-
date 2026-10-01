@@ -524,6 +524,120 @@ def api_schema_validator(
 
 
 # =====================================================================
+# Access-control diff (Broken Access Control — OWASP A01)
+# ---------------------------------------------------------------------
+# Requests each endpoint twice — WITH the session and WITHOUT it — and
+# flags where authorization is not actually enforced: an anonymous caller
+# gets a 2xx, or gets the same response as the authenticated one.
+# =====================================================================
+
+def _is_2xx(status) -> bool:
+    return status is not None and 200 <= status < 300
+
+
+def _bodies_similar(a: str, b: str) -> bool:
+    """True if two response bodies are near-identical by length (±5%)."""
+    a, b = a or "", b or ""
+    if a == b:
+        return True
+    longest = max(len(a), len(b))
+    return longest == 0 or abs(len(a) - len(b)) / longest < 0.05
+
+
+def _classify_access(a_status, a_body, u_status, u_body) -> tuple[str, str]:
+    """Return (verdict, severity) comparing authed (a_) vs unauth (u_)."""
+    if _is_2xx(u_status):
+        if _is_2xx(a_status) and _bodies_similar(a_body, u_body):
+            # Session is ignored entirely — same privileged data either way.
+            return "identical-response", "critical"
+        # Anonymous caller gets a success at all.
+        return "anonymous-access", "high"
+    if u_status in (401, 403) and _is_2xx(a_status):
+        return "enforced", "info"
+    return "inconclusive", "info"
+
+
+def access_control_diff(
+    base_url: str,
+    openapi_src: Optional[str],
+    routes: Optional[list[tuple[str, str]]],
+    auth_headers: dict,
+    log,
+    cancel: threading.Event,
+    record=None,
+    max_endpoints: int = 40,
+) -> None:
+    """Compare authed vs unauthenticated responses to find broken access control."""
+    if not auth_headers:
+        log("[access-control] no session set — fill 'Custom Session Headers/Cookies' "
+            "with an authenticated session first.")
+        return
+
+    if routes:
+        endpoints = routes
+        log(f"[access-control] using {len(endpoints)} custom route(s)")
+    else:
+        src = openapi_src or urljoin(base_url, "/openapi.json")
+        try:
+            endpoints = _load_openapi_routes(base_url, src, auth_headers)
+            log(f"[access-control] discovered {len(endpoints)} operation(s) from {src}")
+        except Exception as exc:  # noqa: BLE001
+            log(f"[access-control] no OpenAPI spec ({exc}); using sensitive-path list")
+            endpoints = [("GET", p) for p in SENSITIVE_PATHS]
+
+    if not endpoints:
+        log("[access-control] no endpoints to test.")
+        return
+    endpoints = endpoints[:max_endpoints]
+    log(f"[access-control] comparing authed vs anonymous on {len(endpoints)} endpoint(s)")
+
+    flagged = 0
+    for method, path in endpoints:
+        if cancel.is_set():
+            log("[access-control] cancelled.")
+            break
+        cpath = _SEG_PARAM.sub("1", path)
+        url = urljoin(base_url, cpath)
+        body = "{}" if method in _BODY_METHODS else None
+
+        a_status, a_body = _send_api(method, url, body, 12.0, auth_headers)
+        if cancel.is_set():
+            break
+        u_status, u_body = _send_api(method, url, body, 12.0, None)
+
+        if isinstance(a_body, str) and a_body.startswith("__transport_error__"):
+            log(f"  [err ] {method} {cpath} (authed) -> {a_body}")
+            continue
+        if isinstance(u_body, str) and u_body.startswith("__transport_error__"):
+            log(f"  [err ] {method} {cpath} (anon) -> {u_body}")
+            continue
+
+        verdict, severity = _classify_access(a_status, a_body, u_status, u_body)
+        tag = f"authed={a_status} anon={u_status}"
+        if verdict == "identical-response":
+            flagged += 1
+            log(f"  [CRIT] {method} {cpath} — SAME response with/without session ({tag})")
+        elif verdict == "anonymous-access":
+            flagged += 1
+            log(f"  [HIGH] {method} {cpath} — anonymous caller allowed ({tag})")
+        elif verdict == "enforced":
+            log(f"  [ ok ] {method} {cpath} — access control enforced ({tag})")
+            continue
+        else:
+            log(f"  [ ?  ] {method} {cpath} — inconclusive ({tag})")
+            continue
+
+        if record:
+            record({
+                "source": "access_control", "severity": severity,
+                "method": method, "path": cpath, "verdict": verdict,
+                "authed_status": a_status, "anon_status": u_status,
+                "title": f"{method} {path}: {verdict}",
+            })
+    log(f"[access-control] done — {flagged} broken-access-control finding(s).")
+
+
+# =====================================================================
 # Configuration file — make the lists above editable without code edits
 # =====================================================================
 
@@ -753,10 +867,16 @@ class ScanLauncher(tk.Tk):
             justify="left",
         ).grid(row=1, column=2, padx=6, pady=4, sticky="w")
 
+        api_btns = ttk.Frame(api)
+        api_btns.grid(row=2, column=1, sticky="w", padx=6, pady=6)
         self.api_validate_btn = ttk.Button(
-            api, text="Validate API schema", command=self.run_api_validator
+            api_btns, text="Validate API schema", command=self.run_api_validator
         )
-        self.api_validate_btn.grid(row=2, column=1, sticky="w", padx=6, pady=6)
+        self.api_validate_btn.pack(side="left")
+        self.access_diff_btn = ttk.Button(
+            api_btns, text="Access-control diff", command=self.run_access_control_diff
+        )
+        self.access_diff_btn.pack(side="left", padx=(6, 0))
 
         api.columnconfigure(1, weight=1)
 
@@ -993,6 +1113,30 @@ class ScanLauncher(tk.Tk):
             label="API schema validation",
         )
 
+    def run_access_control_diff(self) -> None:
+        if self._busy():
+            return
+        url = self._valid_target()
+        if not url:
+            return
+        auth = self._auth_headers()
+        if not auth:
+            messagebox.showwarning(
+                "Session required",
+                "Fill 'Custom Session Headers/Cookies' with an authenticated "
+                "session — the diff compares authed vs anonymous responses.",
+            )
+            return
+        openapi_src = self.openapi_var.get().strip() or None
+        routes_text = self.routes_text.get("1.0", "end").strip()
+        routes = parse_api_routes(routes_text) if routes_text else None
+        self._start_task(
+            lambda log, cancel: access_control_diff(
+                url, openapi_src, routes, auth, log, cancel, record=self._record
+            ),
+            label="access-control diff",
+        )
+
     def _start_task(self, target, label: str) -> None:
         """Run a pure-Python check in a background thread, streaming via log."""
         self._append(f"\n=== {label} ===\n")
@@ -1199,6 +1343,7 @@ class ScanLauncher(tk.Tk):
             self.header_audit_btn,
             self.audit_all_btn,
             self.api_validate_btn,
+            self.access_diff_btn,
         ):
             btn.configure(state=state)
         self.stop_btn.configure(state="normal" if self._scan_running else "disabled")
@@ -1269,7 +1414,8 @@ class ScanLauncher(tk.Tk):
     def _collect_findings(self) -> dict:
         """Aggregate the live findings list into a report structure."""
         by = {s: [f for f in self._findings if f.get("source") == s]
-              for s in ("nuclei", "nikto", "data_exposure", "headers", "api")}
+              for s in ("nuclei", "nikto", "data_exposure", "headers", "api",
+                        "access_control")}
         headers = {
             "missing": [f["header"] for f in by["headers"] if f.get("type") == "missing"],
             "weak": [{"header": f["header"], "note": f.get("note", "")}
@@ -1284,6 +1430,7 @@ class ScanLauncher(tk.Tk):
             "data_exposure": by["data_exposure"],
             "security_headers": headers,
             "api_schema": by["api"],
+            "access_control": by["access_control"],
         }
 
     @staticmethod
@@ -1296,6 +1443,15 @@ class ScanLauncher(tk.Tk):
             f"- **Total findings:** {f['total_findings']}",
             "",
         ]
+        if f.get("access_control"):
+            out.append(f"## Broken access control ({len(f['access_control'])})")
+            for a in f["access_control"]:
+                out.append(
+                    f"- **[{a['severity']}]** `{a['method']} {a['path']}` — "
+                    f"{a['verdict']} (authed={a['authed_status']}, "
+                    f"anon={a['anon_status']})"
+                )
+            out.append("")
         if f["nuclei"]:
             out.append(f"## nuclei ({len(f['nuclei'])})")
             for n in f["nuclei"]:
