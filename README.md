@@ -111,39 +111,44 @@ a sign of improper input handling.
 - **Bounded & cancellable:** capped at 25 endpoints / 300 requests by default,
   and the Stop button cancels it mid-run.
 
-### Access-control diff (Broken Access Control — OWASP A01)
+## Access-Control Diffing Matrix (OWASP A01)
 
-The highest-signal check for a report: it requests each endpoint **twice — with
-the session and without it** — and flags where authorization isn't actually
-enforced. Requires a session in the **Custom Session Headers/Cookies** field.
+The highest-signal authorization check: probe **every endpoint with every
+identity in one pass** and derive findings from the resulting grid. This
+subsumes simple "authed vs anonymous" and "admin vs user" diffs.
 
-- **critical — `identical-response`:** the endpoint returns the *same* response
-  with and without the session — the session is ignored, access control is
-  effectively absent.
-- **high — `anonymous-access`:** an anonymous caller still gets a `2xx` (with
-  different content) — the endpoint should have required auth.
-- **not flagged — `enforced`:** anonymous gets `401/403` while the session gets
-  `2xx` — working as intended.
+Define identities in the **Identities** box, one `[name]` block each, with its
+headers/cookies on the following lines — **list the most-privileged first** (it
+becomes the comparison *reference*):
 
-Endpoints come from the same OpenAPI/custom-routes inputs as the validator; with
-no spec it falls back to the sensitive-path list. Findings appear in a dedicated
-**Broken access control** section at the top of the report.
+```
+[admin]
+Authorization: Bearer <admin-token>
+[user]
+Cookie: session=<user-session>
+```
 
-### Privilege-escalation diff (horizontal/vertical escalation)
+Keep **Include anonymous** ticked to also test an unauthenticated user (an
+`anon` identity with no headers). Endpoints come from the OpenAPI/custom-routes
+fields above; with no spec it falls back to the sensitive-path list.
 
-Compares a **high-privilege** session against a **low-privilege** session to catch
-cases where a lesser user reaches privileged data. Fill **both** the primary and
-secondary session fields, then click **Privilege-escalation diff**.
+Each lesser identity is compared to the reference per endpoint:
 
-- **critical — `privilege-escalation`:** the low-priv session gets the *same*
-  response as the high-priv session — a regular user is reading privileged data.
-- **medium — `low-priv-access-differs`:** the low-priv session also gets a `2xx`
-  but with different content — review for horizontal access / IDOR (may be
-  legitimate per-user scoping).
-- **not flagged — `enforced`:** the low-priv session gets `401/403`.
+- **critical — `privilege-escalation`:** a lesser identity gets the *same*
+  response as the reference — it is reading privileged data.
+- **critical — `missing-auth`:** the anonymous identity gets the same response as
+  the reference — no authentication required.
+- **high — `anonymous-access`:** anonymous gets a `2xx` with different content.
+- **medium — `lesser-access-differs`:** a lesser identity gets a `2xx` with
+  different content — review for horizontal access / IDOR.
+- **not flagged — `enforced`:** the lesser identity gets `401/403`.
 
-Results appear in a dedicated **Privilege escalation** section at the top of the
-report.
+The report includes a per-identity **matrix table** (rows = endpoints, columns =
+identities, cells = status) plus the individual findings, at the top.
+
+> Architecture: shared HTTP primitives live in `probecore.py`; the matrix engine
+> is `accessmatrix.py`; `scan_launcher.py` is the GUI
+> (`probecore ← accessmatrix ← scan_launcher`).
 
 ## Findings report
 
