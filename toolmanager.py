@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import os
 import platform
+import re
 import shutil
 import urllib.error
 import urllib.request
@@ -93,9 +94,21 @@ def nuclei_cmd() -> Optional[list[str]]:
     return [found] if found else None
 
 
+def bundled_perl() -> Optional[str]:
+    """Path to the portable Perl we installed under tools/, if present."""
+    sub = ("perl", "bin", "perl.exe") if os.name == "nt" else ("perl", "bin", "perl")
+    p = TOOLS_DIR.joinpath("perl", *sub)
+    return str(p) if p.is_file() else None
+
+
+def _perl() -> Optional[str]:
+    """Return a usable Perl interpreter: bundled first, then system."""
+    return bundled_perl() or shutil.which("perl")
+
+
 def nikto_cmd() -> Optional[list[str]]:
     """Return the command to run nikto, or None if not available."""
-    perl = shutil.which("perl")
+    perl = _perl()
     local_pl = TOOLS_DIR / "nikto" / "program" / "nikto.pl"
     if local_pl.is_file() and perl:
         return [perl, str(local_pl)]
@@ -195,8 +208,66 @@ def install_nuclei(log: LogFn) -> list[str]:
     return cmd
 
 
+def _strawberry_portable_url(log: LogFn) -> str:
+    """Resolve the latest 64-bit portable Strawberry Perl .zip URL."""
+    for releases in ("https://strawberryperl.com/releases.json",
+                     "http://strawberryperl.com/releases.json"):
+        try:
+            with urllib.request.urlopen(
+                urllib.request.Request(releases, headers=_UA), timeout=60
+            ) as r:
+                data = json.load(r)
+            break
+        except (urllib.error.HTTPError, urllib.error.URLError):
+            data = None
+    if not data:
+        raise RuntimeError("could not reach strawberryperl.com to resolve Perl")
+
+    def version_key(entry: dict) -> tuple:
+        return tuple(int(n) for n in re.findall(r"\d+", entry.get("version", "0"))) or (0,)
+
+    candidates = [
+        e for e in data
+        if e.get("edition") == "portable"
+        and "64" in e.get("archname", "")
+        and str(e.get("url", "")).endswith(".zip")
+    ]
+    if not candidates:
+        raise RuntimeError("no portable Strawberry Perl build listed")
+    return max(candidates, key=version_key)["url"]
+
+
+def install_perl_portable(log: LogFn) -> str:
+    """Download a self-contained portable Perl into tools/perl/ (Windows)."""
+    if os.name != "nt":
+        raise RuntimeError(
+            "automatic Perl install is Windows-only; install perl via your "
+            "package manager (e.g. apt install perl)"
+        )
+    log("Perl not found — fetching portable Strawberry Perl (~140 MB, one-time)…")
+    url = _strawberry_portable_url(log)
+    TOOLS_DIR.mkdir(parents=True, exist_ok=True)
+    archive = TOOLS_DIR / "strawberry-perl-portable.zip"
+    log(f"Downloading {url.rsplit('/', 1)[-1]}…")
+    _download(url, archive, log)
+
+    dest = TOOLS_DIR / "perl"
+    if dest.exists():
+        shutil.rmtree(dest)
+    log("Extracting Perl (this can take a minute)…")
+    with zipfile.ZipFile(archive) as zf:
+        zf.extractall(dest)
+    archive.unlink(missing_ok=True)
+
+    perl = bundled_perl()
+    if perl is None:
+        raise RuntimeError("portable Perl missing after extraction")
+    log(f"Perl ready: {perl}")
+    return perl
+
+
 def install_nikto(log: LogFn) -> list[str]:
-    """Download nikto source into TOOLS_DIR (needs Perl to actually run)."""
+    """Download nikto source into TOOLS_DIR; ensure Perl is available."""
     TOOLS_DIR.mkdir(parents=True, exist_ok=True)
     url = "https://github.com/sullo/nikto/archive/refs/heads/master.zip"
     archive = TOOLS_DIR / "nikto-master.zip"
@@ -214,14 +285,13 @@ def install_nikto(log: LogFn) -> list[str]:
         extracted.rename(target)
     archive.unlink(missing_ok=True)
 
-    if shutil.which("perl") is None:
-        log("[warning] Perl was not found. nikto is a Perl script and needs Perl.")
+    if _perl() is None:
         if os.name == "nt":
-            log("  Install it with:  winget install StrawberryPerl.StrawberryPerl")
-            log("  then restart your terminal and relaunch this app.")
+            install_perl_portable(log)  # self-contained, no admin needed
         else:
+            log("[warning] Perl was not found. nikto is a Perl script and needs Perl.")
             log("  Install perl with your package manager (e.g. apt install perl).")
-        raise RuntimeError("nikto downloaded, but Perl is required to run it")
+            raise RuntimeError("nikto downloaded, but Perl is required to run it")
 
     cmd = nikto_cmd()
     if cmd is None:
@@ -237,7 +307,13 @@ INSTALLERS: dict[str, Callable[[LogFn], list[str]]] = {
 
 
 def scan_env() -> dict[str, str]:
-    """Environment for child scans, with TOOLS_DIR on PATH."""
+    """Environment for child scans, with TOOLS_DIR (and bundled Perl) on PATH."""
     env = os.environ.copy()
-    env["PATH"] = str(TOOLS_DIR) + os.pathsep + env.get("PATH", "")
+    extra = [str(TOOLS_DIR)]
+    # Bundled Strawberry Perl keeps its runtime DLLs (e.g. for HTTPS via
+    # Net::SSLeay) in perl/bin and c/bin; add them so nikto can load them.
+    perl_root = TOOLS_DIR / "perl"
+    if perl_root.is_dir():
+        extra += [str(perl_root / "perl" / "bin"), str(perl_root / "c" / "bin")]
+    env["PATH"] = os.pathsep.join(extra) + os.pathsep + env.get("PATH", "")
     return env

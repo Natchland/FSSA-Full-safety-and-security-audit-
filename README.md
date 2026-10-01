@@ -50,9 +50,12 @@ any machine and it provisions itself.
 - **nuclei** — the official release binary for your OS/arch is downloaded from
   GitHub and extracted into `tools/`.
 - **nikto** — the source is downloaded into `tools/nikto/` and run via Perl.
-  nikto is a Perl script, so **Perl must be installed**:
-  - Windows: `winget install StrawberryPerl.StrawberryPerl` (then relaunch).
-  - Debian/Ubuntu: `sudo apt install perl` (usually already present).
+  nikto is a Perl script, so Perl is also handled automatically:
+  - **Windows:** if Perl is missing, a self-contained **portable Strawberry
+    Perl** (~140 MB, one-time) is downloaded into `tools/perl/` — no installer,
+    no admin rights, no PATH changes.
+  - **Linux/macOS:** Perl is almost always preinstalled; if not, install it
+    with your package manager (e.g. `sudo apt install perl`).
 
 Use the **Install / update tools** button to re-download or update them later.
 Override the download location with the `FSSA_TOOLS_DIR` environment variable.
