@@ -418,6 +418,73 @@ def api_schema_validator(
         log(f"[api-fuzz] NOTE: stopped at the {max_requests}-request safety cap.")
 
 
+# =====================================================================
+# Configuration file — make the lists above editable without code edits
+# =====================================================================
+
+CONFIG_PATH = Path(
+    os.environ.get("FSSA_CONFIG", Path(__file__).resolve().parent / "fssa_config.json")
+)
+
+
+def _rebuild_signatures() -> None:
+    global _COMPILED_SIGNATURES
+    _COMPILED_SIGNATURES = (
+        [("db-error", re.compile(p, re.I)) for p in _DB_PATTERNS]
+        + [("stack-trace", re.compile(p, re.I)) for p in _STACK_PATTERNS]
+    )
+
+
+def load_config(path: Path = CONFIG_PATH, log=None) -> bool:
+    """Override the built-in path/header/mutation/signature lists from JSON.
+
+    Any key present replaces the corresponding default; missing keys keep the
+    defaults. Returns True if a config file was found and applied.
+    """
+    global SENSITIVE_PATHS, SECURITY_HEADERS, _PATH_PARAM_MUTATIONS
+    global _MALFORMED_BODIES, _DB_PATTERNS, _STACK_PATTERNS
+
+    path = Path(path)
+    if not path.is_file():
+        return False
+    try:
+        cfg = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        if log:
+            log(f"[config] failed to read {path}: {exc}")
+        return False
+
+    applied = []
+    if isinstance(cfg.get("sensitive_paths"), list):
+        SENSITIVE_PATHS = [str(p) for p in cfg["sensitive_paths"]]
+        applied.append("sensitive_paths")
+    if isinstance(cfg.get("security_headers"), dict):
+        SECURITY_HEADERS = {str(k): str(v) for k, v in cfg["security_headers"].items()}
+        applied.append("security_headers")
+    if isinstance(cfg.get("api_path_mutations"), list):
+        _PATH_PARAM_MUTATIONS = [(str(a), str(b)) for a, b in cfg["api_path_mutations"]]
+        applied.append("api_path_mutations")
+    if isinstance(cfg.get("api_malformed_bodies"), list):
+        _MALFORMED_BODIES = [(str(a), str(b)) for a, b in cfg["api_malformed_bodies"]]
+        applied.append("api_malformed_bodies")
+    if isinstance(cfg.get("db_error_patterns"), list):
+        _DB_PATTERNS = [str(p) for p in cfg["db_error_patterns"]]
+        applied.append("db_error_patterns")
+    if isinstance(cfg.get("stack_trace_patterns"), list):
+        _STACK_PATTERNS = [str(p) for p in cfg["stack_trace_patterns"]]
+        applied.append("stack_trace_patterns")
+
+    if "db_error_patterns" in applied or "stack_trace_patterns" in applied:
+        try:
+            _rebuild_signatures()
+        except re.error as exc:
+            if log:
+                log(f"[config] invalid regex in patterns: {exc}")
+    if log:
+        log(f"[config] loaded {path.name}: overrode {', '.join(applied) or 'nothing'}")
+    return True
+
+
 # Directory that holds your custom internal scripts. Override with the
 # FSSA_SCRIPTS_DIR environment variable if you keep them elsewhere.
 DEFAULT_SCRIPTS_DIR = Path(
@@ -443,6 +510,9 @@ class ScanLauncher(tk.Tk):
         self._cancel = threading.Event()  # cooperative stop for Python tasks
 
         self._build_ui()
+        # Apply any user config overrides (paths, headers, signatures, …).
+        if load_config(CONFIG_PATH, log=self._append):
+            pass
         self._refresh_tool_status()
         self._poll_output_queue()
         # Offer to install missing scanners once the window is visible.
@@ -609,10 +679,16 @@ class ScanLauncher(tk.Tk):
         ttk.Button(control, text="Save output…", command=self.save_output).pack(
             side="left", padx=(6, 0)
         )
+        ttk.Button(control, text="Save report…", command=self.save_report).pack(
+            side="left", padx=(6, 0)
+        )
         self.install_btn = ttk.Button(
             control, text="Install / update tools", command=self.install_tools
         )
         self.install_btn.pack(side="left", padx=(6, 0))
+        ttk.Button(control, text="Reload config", command=self.reload_config).pack(
+            side="left", padx=(6, 0)
+        )
 
         self.status_var = tk.StringVar(value="Idle.")
         ttk.Label(control, textvariable=self.status_var).pack(side="right")
@@ -1003,6 +1079,151 @@ class ScanLauncher(tk.Tk):
         if path:
             Path(path).write_text(self.output.get("1.0", "end"), encoding="utf-8")
             self.status_var.set(f"Saved to {path}")
+
+    # --------------------------------------------------- findings report ---
+
+    def _collect_findings(self) -> dict:
+        """Parse the output pane into structured findings across all tools."""
+        text = self.output.get("1.0", "end")
+        data_exposure: list[dict] = []
+        headers_missing: list[str] = []
+        headers_weak: list[dict] = []
+        api: list[dict] = []
+        nuclei: list[dict] = []
+        nikto: list[str] = []
+
+        nuclei_re = re.compile(
+            r"^\[([^\]]+)\] \[([^\]]+)\] \[(critical|high|medium|low|info|unknown)\] (.+)$"
+        )
+        last_api: dict | None = None
+        for raw in text.splitlines():
+            line = raw.rstrip()
+            t = line.strip()
+
+            m = re.search(r"\[WARN\]\s+(\S+)\s+->\s+(\d+)\s+OK", t)
+            if m and "EXPOSED" in t:
+                data_exposure.append({"path": m.group(1), "status": int(m.group(2))})
+                continue
+            m = re.search(r"\[GAP \]\s+([\w-]+)", t)
+            if m:
+                headers_missing.append(m.group(1))
+                continue
+            m = re.search(r"\[ ok \]\s+([\w-]+):.*\(weak:(.*?)\)", t)
+            if m:
+                headers_weak.append({"header": m.group(1), "note": m.group(2).strip()})
+                continue
+            m = re.search(r"\[WARN\] \[([^\]]+)\] -> (\S+)\s+LEAK: (\S+)", t)
+            if m:
+                last_api = {
+                    "variant": m.group(1), "status": m.group(2),
+                    "leak": m.group(3), "detail": "",
+                }
+                api.append(last_api)
+                continue
+            if t.startswith("↳") and last_api is not None:
+                last_api["detail"] = t.lstrip("↳ ").strip()
+                last_api = None
+                continue
+            m = nuclei_re.match(t)
+            if m:
+                nuclei.append({
+                    "template": m.group(1), "protocol": m.group(2),
+                    "severity": m.group(3), "target": m.group(4),
+                })
+                continue
+            if line.startswith("+ "):
+                nikto.append(line[2:].strip())
+
+        total = (len(data_exposure) + len(headers_missing) + len(headers_weak)
+                 + len(api) + len(nuclei) + len(nikto))
+        return {
+            "target": self.url_var.get().strip(),
+            "generated": datetime.now().isoformat(timespec="seconds"),
+            "total_findings": total,
+            "nuclei": nuclei,
+            "nikto": nikto,
+            "data_exposure": data_exposure,
+            "security_headers": {"missing": headers_missing, "weak": headers_weak},
+            "api_schema": api,
+        }
+
+    @staticmethod
+    def _render_markdown(f: dict) -> str:
+        out = [
+            "# FSSA Findings Report",
+            "",
+            f"- **Target:** {f['target']}",
+            f"- **Generated:** {f['generated']}",
+            f"- **Total findings:** {f['total_findings']}",
+            "",
+        ]
+        if f["nuclei"]:
+            out.append(f"## nuclei ({len(f['nuclei'])})")
+            for n in f["nuclei"]:
+                out.append(
+                    f"- **[{n['severity']}]** `{n['template']}` "
+                    f"({n['protocol']}) — {n['target']}"
+                )
+            out.append("")
+        if f["nikto"]:
+            out.append(f"## nikto ({len(f['nikto'])})")
+            out += [f"- {line}" for line in f["nikto"]]
+            out.append("")
+        if f["data_exposure"]:
+            out.append(f"## Data exposure ({len(f['data_exposure'])})")
+            out += [f"- `{d['path']}` → {d['status']} OK" for d in f["data_exposure"]]
+            out.append("")
+        headers = f["security_headers"]
+        if headers["missing"] or headers["weak"]:
+            out.append("## Security headers")
+            if headers["missing"]:
+                out.append(f"**Missing ({len(headers['missing'])}):** "
+                           + ", ".join(headers["missing"]))
+            for w in headers["weak"]:
+                out.append(f"- weak: {w['header']} — {w['note']}")
+            out.append("")
+        if f["api_schema"]:
+            out.append(f"## API schema validation ({len(f['api_schema'])})")
+            for a in f["api_schema"]:
+                out.append(f"- `{a['variant']}` → {a['status']} — {a['leak']}")
+                if a["detail"]:
+                    out.append(f"  - {a['detail']}")
+            out.append("")
+        if f["total_findings"] == 0:
+            out.append("_No findings parsed from the current output._")
+        return "\n".join(out) + "\n"
+
+    def save_report(self) -> None:
+        findings = self._collect_findings()
+        if findings["total_findings"] == 0 and not messagebox.askyesno(
+            "No findings",
+            "No findings were parsed from the output. Save an empty report anyway?",
+        ):
+            return
+        default = f"fssa-report-{datetime.now():%Y%m%d-%H%M%S}.md"
+        path = filedialog.asksaveasfilename(
+            title="Save findings report",
+            initialfile=default,
+            defaultextension=".md",
+            filetypes=[("Markdown", "*.md"), ("JSON", "*.json"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        if path.lower().endswith(".json"):
+            Path(path).write_text(json.dumps(findings, indent=2), encoding="utf-8")
+        else:
+            Path(path).write_text(self._render_markdown(findings), encoding="utf-8")
+        self.status_var.set(
+            f"Report saved ({findings['total_findings']} findings) to {path}"
+        )
+
+    # ----------------------------------------------------------- config ---
+
+    def reload_config(self) -> None:
+        if load_config(CONFIG_PATH, log=self._append):
+            self.status_var.set(f"Config reloaded from {CONFIG_PATH.name}")
+        else:
+            self._append(f"[config] no config file at {CONFIG_PATH} (using defaults)\n")
 
     def _refresh_tool_status(self) -> None:
         nuclei = toolmanager.nuclei_cmd()

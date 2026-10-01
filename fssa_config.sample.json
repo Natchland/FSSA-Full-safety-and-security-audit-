@@ -1,0 +1,110 @@
+{
+  "sensitive_paths": [
+    "/.git/HEAD",
+    "/.git/config",
+    "/.env",
+    "/.htaccess",
+    "/.DS_Store",
+    "/config.bak",
+    "/config.php.bak",
+    "/wp-config.php.bak",
+    "/backup.sql",
+    "/backup.zip",
+    "/db.sql",
+    "/dump.sql",
+    "/phpinfo.php",
+    "/server-status"
+  ],
+  "security_headers": {
+    "Strict-Transport-Security": "HSTS \u2014 forces HTTPS, prevents downgrade",
+    "Content-Security-Policy": "CSP \u2014 mitigates XSS / content injection",
+    "X-Frame-Options": "clickjacking protection",
+    "X-Content-Type-Options": "blocks MIME-type sniffing",
+    "Referrer-Policy": "controls referrer leakage",
+    "Permissions-Policy": "restricts powerful browser features"
+  },
+  "api_path_mutations": [
+    [
+      "int->string",
+      "FSSAstr"
+    ],
+    [
+      "sql-quote",
+      "1'"
+    ],
+    [
+      "negative",
+      "-1"
+    ],
+    [
+      "overflow",
+      "99999999999999999999"
+    ],
+    [
+      "null-word",
+      "null"
+    ]
+  ],
+  "api_malformed_bodies": [
+    [
+      "truncated-json",
+      "{\"id\": "
+    ],
+    [
+      "trailing-comma",
+      "{\"id\": 1,}"
+    ],
+    [
+      "not-json",
+      "this is not json"
+    ],
+    [
+      "wrong-root-type",
+      "[1, 2, 3]"
+    ],
+    [
+      "type-swapped",
+      "{\"id\": \"not_a_number\", \"enabled\": \"maybe\", \"count\": [1,2,3]}"
+    ]
+  ],
+  "db_error_patterns": [
+    "you have an error in your sql syntax",
+    "\\bSQL syntax\\b",
+    "\\bSQLSTATE\\b",
+    "ORA-\\d{5}",
+    "\\bPG::\\w+",
+    "\\bpsql\\b",
+    "postgresql",
+    "mysql_fetch",
+    "unclosed quotation mark",
+    "sqlite3\\.\\w+",
+    "SQLiteException",
+    "MongoError",
+    "\\bpymongo\\b",
+    "System\\.Data\\.SqlClient",
+    "org\\.hibernate",
+    "\\bJDBC\\b",
+    "SequelizeDatabaseError",
+    "psycopg2\\.\\w+"
+  ],
+  "stack_trace_patterns": [
+    "Traceback \\(most recent call last\\)",
+    "File \".*\", line \\d+",
+    "\\bat [\\w.$]+\\([\\w.]+\\.java:\\d+\\)",
+    "Exception in thread",
+    "NullPointerException",
+    "RuntimeException",
+    "Werkzeug Debugger",
+    "werkzeug",
+    "Whitelabel Error Page",
+    "Fatal error:",
+    "Warning: .* on line \\d+",
+    "Notice: .* on line \\d+",
+    "Microsoft OLE DB",
+    "ASP\\.NET",
+    "panic:",
+    "goroutine \\d+ \\[",
+    "stack trace",
+    "\\.rb:\\d+:in "
+  ]
+}

@@ -90,6 +90,33 @@ a sign of improper input handling.
 - **Bounded & cancellable:** capped at 25 endpoints / 300 requests by default,
   and the Stop button cancels it mid-run.
 
+## Findings report
+
+Click **Save report…** to export a consolidated findings report parsed from the
+current output window — spanning nuclei, nikto, the data-exposure scan, the
+security-header audit, and the API schema validator. Choose a `.md` filename for
+a Markdown report or `.json` for structured JSON (pick the extension in the save
+dialog). **Save output…** still saves the full raw log separately.
+
+## Configuration file
+
+The path list, security headers, API mutations, and error signatures are all
+editable without touching code. Copy `fssa_config.sample.json` to
+`fssa_config.json` (next to `scan_launcher.py`, or point `FSSA_CONFIG` at it) and
+edit any of these keys — each one present replaces that default:
+
+| Key | Overrides |
+|-----|-----------|
+| `sensitive_paths` | data-exposure path list |
+| `security_headers` | audited headers (name → description) |
+| `api_path_mutations` | `[label, value]` pairs for path/param fuzzing |
+| `api_malformed_bodies` | `[label, body]` pairs for JSON body fuzzing |
+| `db_error_patterns` | DB-error regex signatures |
+| `stack_trace_patterns` | stack-trace regex signatures |
+
+Config loads automatically on launch; use **Reload config** to re-apply after
+editing without restarting.
+
 ## Automatic tool installation
 
 On launch, the app checks for `nuclei` and `nikto`. If either is missing it
