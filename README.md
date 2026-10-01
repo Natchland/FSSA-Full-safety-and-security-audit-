@@ -129,6 +129,22 @@ Endpoints come from the same OpenAPI/custom-routes inputs as the validator; with
 no spec it falls back to the sensitive-path list. Findings appear in a dedicated
 **Broken access control** section at the top of the report.
 
+### Privilege-escalation diff (horizontal/vertical escalation)
+
+Compares a **high-privilege** session against a **low-privilege** session to catch
+cases where a lesser user reaches privileged data. Fill **both** the primary and
+secondary session fields, then click **Privilege-escalation diff**.
+
+- **critical — `privilege-escalation`:** the low-priv session gets the *same*
+  response as the high-priv session — a regular user is reading privileged data.
+- **medium — `low-priv-access-differs`:** the low-priv session also gets a `2xx`
+  but with different content — review for horizontal access / IDOR (may be
+  legitimate per-user scoping).
+- **not flagged — `enforced`:** the low-priv session gets `401/403`.
+
+Results appear in a dedicated **Privilege escalation** section at the top of the
+report.
+
 ## Findings report
 
 Findings are collected **live** as tools run — each scanner records structured

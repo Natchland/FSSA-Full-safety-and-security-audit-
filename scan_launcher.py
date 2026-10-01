@@ -524,11 +524,12 @@ def api_schema_validator(
 
 
 # =====================================================================
-# Access-control diff (Broken Access Control — OWASP A01)
+# Authorization diffs (Broken Access Control / Privilege Escalation — A01)
 # ---------------------------------------------------------------------
-# Requests each endpoint twice — WITH the session and WITHOUT it — and
-# flags where authorization is not actually enforced: an anonymous caller
-# gets a 2xx, or gets the same response as the authenticated one.
+# Request each endpoint under two identities and compare the responses:
+#   - access-control diff : session vs anonymous (is auth enforced at all?)
+#   - privilege diff      : high-priv session vs low-priv session (can a
+#                           lesser user reach privileged data?)
 # =====================================================================
 
 def _is_2xx(status) -> bool:
@@ -544,97 +545,119 @@ def _bodies_similar(a: str, b: str) -> bool:
     return longest == 0 or abs(len(a) - len(b)) / longest < 0.05
 
 
-def _classify_access(a_status, a_body, u_status, u_body) -> tuple[str, str]:
-    """Return (verdict, severity) comparing authed (a_) vs unauth (u_)."""
-    if _is_2xx(u_status):
-        if _is_2xx(a_status) and _bodies_similar(a_body, u_body):
-            # Session is ignored entirely — same privileged data either way.
-            return "identical-response", "critical"
-        # Anonymous caller gets a success at all.
-        return "anonymous-access", "high"
-    if u_status in (401, 403) and _is_2xx(a_status):
-        return "enforced", "info"
-    return "inconclusive", "info"
+def _classify_anon(hi_status, hi_body, lo_status, lo_body) -> tuple[str, str, bool]:
+    """Compare session (hi) vs anonymous (lo). Returns (verdict, severity, is_finding)."""
+    if _is_2xx(lo_status):
+        if _is_2xx(hi_status) and _bodies_similar(hi_body, lo_body):
+            return "identical-response", "critical", True  # session ignored
+        return "anonymous-access", "high", True            # anon gets a 2xx
+    if lo_status in (401, 403) and _is_2xx(hi_status):
+        return "enforced", "info", False
+    return "inconclusive", "info", False
 
 
-def access_control_diff(
-    base_url: str,
-    openapi_src: Optional[str],
-    routes: Optional[list[tuple[str, str]]],
-    auth_headers: dict,
-    log,
-    cancel: threading.Event,
-    record=None,
-    max_endpoints: int = 40,
-) -> None:
-    """Compare authed vs unauthenticated responses to find broken access control."""
-    if not auth_headers:
-        log("[access-control] no session set — fill 'Custom Session Headers/Cookies' "
-            "with an authenticated session first.")
-        return
+def _classify_privesc(hi_status, hi_body, lo_status, lo_body) -> tuple[str, str, bool]:
+    """Compare high-priv (hi) vs low-priv (lo). Returns (verdict, severity, is_finding)."""
+    if _is_2xx(lo_status) and _is_2xx(hi_status):
+        if _bodies_similar(hi_body, lo_body):
+            # Low-priv user receives the same data as the high-priv user.
+            return "privilege-escalation", "critical", True
+        # Low-priv user can reach the endpoint but sees different data.
+        return "low-priv-access-differs", "medium", True
+    if lo_status in (401, 403) and _is_2xx(hi_status):
+        return "enforced", "info", False
+    return "inconclusive", "info", False
 
+
+def _resolve_endpoints(base_url, openapi_src, routes, hi_headers, source, log):
+    """Shared endpoint discovery: custom routes, OpenAPI, or sensitive paths."""
     if routes:
-        endpoints = routes
-        log(f"[access-control] using {len(endpoints)} custom route(s)")
-    else:
-        src = openapi_src or urljoin(base_url, "/openapi.json")
-        try:
-            endpoints = _load_openapi_routes(base_url, src, auth_headers)
-            log(f"[access-control] discovered {len(endpoints)} operation(s) from {src}")
-        except Exception as exc:  # noqa: BLE001
-            log(f"[access-control] no OpenAPI spec ({exc}); using sensitive-path list")
-            endpoints = [("GET", p) for p in SENSITIVE_PATHS]
+        log(f"[{source}] using {len(routes)} custom route(s)")
+        return list(routes)
+    src = openapi_src or urljoin(base_url, "/openapi.json")
+    try:
+        eps = _load_openapi_routes(base_url, src, hi_headers)
+        log(f"[{source}] discovered {len(eps)} operation(s) from {src}")
+        return eps
+    except Exception as exc:  # noqa: BLE001
+        log(f"[{source}] no OpenAPI spec ({exc}); using sensitive-path list")
+        return [("GET", p) for p in SENSITIVE_PATHS]
 
+
+def _auth_diff(
+    base_url, openapi_src, routes, hi_headers, lo_headers, lo_label,
+    classify, source, log, cancel, record=None, max_endpoints=40,
+) -> None:
+    """Core loop: compare each endpoint under two identities (hi vs lo)."""
+    endpoints = _resolve_endpoints(base_url, openapi_src, routes, hi_headers, source, log)
     if not endpoints:
-        log("[access-control] no endpoints to test.")
+        log(f"[{source}] no endpoints to test.")
         return
     endpoints = endpoints[:max_endpoints]
-    log(f"[access-control] comparing authed vs anonymous on {len(endpoints)} endpoint(s)")
+    log(f"[{source}] comparing session vs {lo_label} on {len(endpoints)} endpoint(s)")
 
     flagged = 0
     for method, path in endpoints:
         if cancel.is_set():
-            log("[access-control] cancelled.")
+            log(f"[{source}] cancelled.")
             break
         cpath = _SEG_PARAM.sub("1", path)
         url = urljoin(base_url, cpath)
         body = "{}" if method in _BODY_METHODS else None
 
-        a_status, a_body = _send_api(method, url, body, 12.0, auth_headers)
+        hi_status, hi_body = _send_api(method, url, body, 12.0, hi_headers)
         if cancel.is_set():
             break
-        u_status, u_body = _send_api(method, url, body, 12.0, None)
+        lo_status, lo_body = _send_api(method, url, body, 12.0, lo_headers)
 
-        if isinstance(a_body, str) and a_body.startswith("__transport_error__"):
-            log(f"  [err ] {method} {cpath} (authed) -> {a_body}")
+        if isinstance(hi_body, str) and hi_body.startswith("__transport_error__"):
+            log(f"  [err ] {method} {cpath} (session) -> {hi_body}")
             continue
-        if isinstance(u_body, str) and u_body.startswith("__transport_error__"):
-            log(f"  [err ] {method} {cpath} (anon) -> {u_body}")
-            continue
-
-        verdict, severity = _classify_access(a_status, a_body, u_status, u_body)
-        tag = f"authed={a_status} anon={u_status}"
-        if verdict == "identical-response":
-            flagged += 1
-            log(f"  [CRIT] {method} {cpath} — SAME response with/without session ({tag})")
-        elif verdict == "anonymous-access":
-            flagged += 1
-            log(f"  [HIGH] {method} {cpath} — anonymous caller allowed ({tag})")
-        elif verdict == "enforced":
-            log(f"  [ ok ] {method} {cpath} — access control enforced ({tag})")
-            continue
-        else:
-            log(f"  [ ?  ] {method} {cpath} — inconclusive ({tag})")
+        if isinstance(lo_body, str) and lo_body.startswith("__transport_error__"):
+            log(f"  [err ] {method} {cpath} ({lo_label}) -> {lo_body}")
             continue
 
+        verdict, severity, is_finding = classify(hi_status, hi_body, lo_status, lo_body)
+        tag = f"session={hi_status} {lo_label}={lo_status}"
+        if not is_finding:
+            state = "enforced" if verdict == "enforced" else "inconclusive"
+            log(f"  [ {'ok' if state == 'enforced' else '?'} ] {method} {cpath} — {state} ({tag})")
+            continue
+
+        flagged += 1
+        level = {"critical": "CRIT", "high": "HIGH", "medium": "MED "}.get(severity, "WARN")
+        log(f"  [{level}] {method} {cpath} — {verdict} ({tag})")
         if record:
             record({
-                "source": "access_control", "severity": severity,
+                "source": source, "severity": severity,
                 "method": method, "path": cpath, "verdict": verdict,
-                "authed_status": a_status, "anon_status": u_status,
+                "high_status": hi_status, "low_status": lo_status,
+                "low_label": lo_label,
                 "title": f"{method} {path}: {verdict}",
             })
-    log(f"[access-control] done — {flagged} broken-access-control finding(s).")
+    log(f"[{source}] done — {flagged} finding(s).")
+
+
+def access_control_diff(base_url, openapi_src, routes, auth_headers, log, cancel,
+                        record=None, max_endpoints=40) -> None:
+    """Session vs anonymous — detects missing/ineffective access control."""
+    if not auth_headers:
+        log("[access-control] no session set — fill 'Custom Session Headers/Cookies' "
+            "with an authenticated session first.")
+        return
+    _auth_diff(base_url, openapi_src, routes, auth_headers, None, "anon",
+               _classify_anon, "access_control", log, cancel, record, max_endpoints)
+
+
+def privilege_escalation_diff(base_url, openapi_src, routes, hi_headers, lo_headers,
+                              log, cancel, record=None, max_endpoints=40) -> None:
+    """High-priv vs low-priv session — detects privilege escalation."""
+    if not hi_headers or not lo_headers:
+        log("[priv-esc] needs BOTH a primary (high-priv) and a secondary "
+            "(low-priv) session set.")
+        return
+    _auth_diff(base_url, openapi_src, routes, hi_headers, lo_headers, "low-priv",
+               _classify_privesc, "privilege_escalation", log, cancel, record, max_endpoints)
 
 
 # =====================================================================
@@ -763,15 +786,29 @@ class ScanLauncher(tk.Tk):
         # --- Session authentication (optional) ----------------------------
         sess = ttk.LabelFrame(self, text="Custom Session Headers/Cookies (optional)")
         sess.pack(fill="x", **pad)
-        self.auth_text = tk.Text(sess, height=3, width=50)
-        self.auth_text.pack(side="left", fill="x", expand=True, padx=6, pady=4)
+
+        ttk.Label(sess, text="Primary session\n(high-priv):", justify="left").grid(
+            row=0, column=0, padx=6, pady=4, sticky="nw"
+        )
+        self.auth_text = tk.Text(sess, height=2, width=50)
+        self.auth_text.grid(row=0, column=1, sticky="ew", padx=6, pady=4)
+
+        ttk.Label(sess, text="Secondary session\n(low-priv, optional):", justify="left").grid(
+            row=1, column=0, padx=6, pady=4, sticky="nw"
+        )
+        self.auth_text_low = tk.Text(sess, height=2, width=50)
+        self.auth_text_low.grid(row=1, column=1, sticky="ew", padx=6, pady=4)
+
         ttk.Label(
             sess,
             justify="left",
-            text=("One per line, e.g.\nAuthorization: Bearer <token>\n"
-                  "Cookie: session=abc; csrf=xyz\n"
-                  "Applied to data-exposure, header &\nAPI probes (and nuclei via -H)."),
-        ).pack(side="left", padx=6, pady=4)
+            text=("One header/cookie per line, e.g.\n"
+                  "Authorization: Bearer <token>\n"
+                  "Cookie: session=abc; csrf=xyz\n\n"
+                  "Primary applies to all probes (+nuclei -H).\n"
+                  "Add a secondary session for the\nprivilege-escalation diff."),
+        ).grid(row=0, column=2, rowspan=2, padx=6, pady=4, sticky="w")
+        sess.columnconfigure(1, weight=1)
 
         # --- Scanner buttons ----------------------------------------------
         btns = ttk.LabelFrame(self, text="Scans")
@@ -877,6 +914,11 @@ class ScanLauncher(tk.Tk):
             api_btns, text="Access-control diff", command=self.run_access_control_diff
         )
         self.access_diff_btn.pack(side="left", padx=(6, 0))
+        self.privesc_diff_btn = ttk.Button(
+            api_btns, text="Privilege-escalation diff",
+            command=self.run_privilege_escalation_diff,
+        )
+        self.privesc_diff_btn.pack(side="left", padx=(6, 0))
 
         api.columnconfigure(1, weight=1)
 
@@ -970,8 +1012,12 @@ class ScanLauncher(tk.Tk):
         return url
 
     def _auth_headers(self) -> dict:
-        """Parse the session-auth field into a headers dict (empty if blank)."""
+        """Parse the primary session-auth field into a headers dict."""
         return parse_auth_headers(self.auth_text.get("1.0", "end"))
+
+    def _auth_headers_low(self) -> dict:
+        """Parse the secondary (low-priv) session-auth field into a headers dict."""
+        return parse_auth_headers(self.auth_text_low.get("1.0", "end"))
 
     def _busy(self) -> bool:
         if self._installing:
@@ -1135,6 +1181,31 @@ class ScanLauncher(tk.Tk):
                 url, openapi_src, routes, auth, log, cancel, record=self._record
             ),
             label="access-control diff",
+        )
+
+    def run_privilege_escalation_diff(self) -> None:
+        if self._busy():
+            return
+        url = self._valid_target()
+        if not url:
+            return
+        hi = self._auth_headers()
+        lo = self._auth_headers_low()
+        if not hi or not lo:
+            messagebox.showwarning(
+                "Two sessions required",
+                "Fill BOTH the primary (high-priv) and secondary (low-priv) "
+                "session fields — the diff compares what each identity can reach.",
+            )
+            return
+        openapi_src = self.openapi_var.get().strip() or None
+        routes_text = self.routes_text.get("1.0", "end").strip()
+        routes = parse_api_routes(routes_text) if routes_text else None
+        self._start_task(
+            lambda log, cancel: privilege_escalation_diff(
+                url, openapi_src, routes, hi, lo, log, cancel, record=self._record
+            ),
+            label="privilege-escalation diff",
         )
 
     def _start_task(self, target, label: str) -> None:
@@ -1344,6 +1415,7 @@ class ScanLauncher(tk.Tk):
             self.audit_all_btn,
             self.api_validate_btn,
             self.access_diff_btn,
+            self.privesc_diff_btn,
         ):
             btn.configure(state=state)
         self.stop_btn.configure(state="normal" if self._scan_running else "disabled")
@@ -1415,7 +1487,7 @@ class ScanLauncher(tk.Tk):
         """Aggregate the live findings list into a report structure."""
         by = {s: [f for f in self._findings if f.get("source") == s]
               for s in ("nuclei", "nikto", "data_exposure", "headers", "api",
-                        "access_control")}
+                        "access_control", "privilege_escalation")}
         headers = {
             "missing": [f["header"] for f in by["headers"] if f.get("type") == "missing"],
             "weak": [{"header": f["header"], "note": f.get("note", "")}
@@ -1431,6 +1503,7 @@ class ScanLauncher(tk.Tk):
             "security_headers": headers,
             "api_schema": by["api"],
             "access_control": by["access_control"],
+            "privilege_escalation": by["privilege_escalation"],
         }
 
     @staticmethod
@@ -1443,15 +1516,20 @@ class ScanLauncher(tk.Tk):
             f"- **Total findings:** {f['total_findings']}",
             "",
         ]
-        if f.get("access_control"):
-            out.append(f"## Broken access control ({len(f['access_control'])})")
-            for a in f["access_control"]:
-                out.append(
-                    f"- **[{a['severity']}]** `{a['method']} {a['path']}` — "
-                    f"{a['verdict']} (authed={a['authed_status']}, "
-                    f"anon={a['anon_status']})"
-                )
-            out.append("")
+        for key, heading in (
+            ("privilege_escalation", "Privilege escalation"),
+            ("access_control", "Broken access control"),
+        ):
+            items = f.get(key)
+            if items:
+                out.append(f"## {heading} ({len(items)})")
+                for a in items:
+                    out.append(
+                        f"- **[{a['severity']}]** `{a['method']} {a['path']}` — "
+                        f"{a['verdict']} (session={a['high_status']}, "
+                        f"{a['low_label']}={a['low_status']})"
+                    )
+                out.append("")
         if f["nuclei"]:
             out.append(f"## nuclei ({len(f['nuclei'])})")
             for n in f["nuclei"]:
