@@ -20,20 +20,43 @@ custom internal scripts against a target URL during authorized security audits.
 
 ## Requirements
 
-- Python 3.9+ with Tkinter (`python3-tk` on Debian/Ubuntu).
-- [`nuclei`](https://github.com/projectdiscovery/nuclei) and
-  [`nikto`](https://github.com/sullo/nikto) on your `PATH` for those buttons.
-  Missing tools are reported in the output pane; the rest of the GUI still works.
+- Python 3.9+ with Tkinter (`python3-tk` on Debian/Ubuntu; included with the
+  python.org installer on Windows/macOS).
+- **The scanners are installed automatically** — see below. The only external
+  dependency you may need to install yourself is **Perl**, which nikto requires
+  to run.
 
 ## Usage
 
+Launch with whatever Python command your machine uses:
+
 ```bash
-python3 scan_launcher.py
+python3 scan_launcher.py     # Linux / macOS
+py scan_launcher.py          # Windows
 ```
 
 1. Enter the target URL (e.g. `https://example.com`).
 2. Tick **"I am authorized to scan this target."**
 3. Click a scan button, or pick a custom script and click **Run script**.
+
+## Automatic tool installation
+
+On launch, the app checks for `nuclei` and `nikto`. If either is missing it
+offers to download it into a local `tools/` folder next to the script — no
+admin rights, no package manager, and no PATH/terminal-restart needed. This
+works the same on **Linux, Windows, and macOS**, so you can clone the repo on
+any machine and it provisions itself.
+
+- **nuclei** — the official release binary for your OS/arch is downloaded from
+  GitHub and extracted into `tools/`.
+- **nikto** — the source is downloaded into `tools/nikto/` and run via Perl.
+  nikto is a Perl script, so **Perl must be installed**:
+  - Windows: `winget install StrawberryPerl.StrawberryPerl` (then relaunch).
+  - Debian/Ubuntu: `sudo apt install perl` (usually already present).
+
+Use the **Install / update tools** button to re-download or update them later.
+Override the download location with the `FSSA_TOOLS_DIR` environment variable.
+The `tools/` folder is git-ignored.
 
 ## Custom scripts
 

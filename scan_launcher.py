@@ -18,7 +18,6 @@ from __future__ import annotations
 import os
 import queue
 import shlex
-import shutil
 import signal
 import subprocess
 import sys
@@ -29,6 +28,15 @@ from urllib.parse import urlparse
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+
+import toolmanager
+
+
+class _Signal:
+    """Marker pushed through the output queue to report completion."""
+
+    def __init__(self, kind: str) -> None:
+        self.kind = kind
 
 
 # Directory that holds your custom internal scripts. Override with the
@@ -47,14 +55,18 @@ class ScanLauncher(tk.Tk):
         self.geometry("860x620")
         self.minsize(700, 500)
 
-        # State for the currently running scan.
+        # State for the currently running scan / install.
         self._proc: subprocess.Popen | None = None
-        self._output_q: "queue.Queue[str | None]" = queue.Queue()
+        self._output_q: "queue.Queue[str | _Signal]" = queue.Queue()
         self._scripts_dir = DEFAULT_SCRIPTS_DIR
+        self._scan_running = False
+        self._installing = False
 
         self._build_ui()
         self._refresh_tool_status()
         self._poll_output_queue()
+        # Offer to install missing scanners once the window is visible.
+        self.after(400, self._autostart_install)
 
     # ---------------------------------------------------------------- UI ---
 
@@ -133,6 +145,10 @@ class ScanLauncher(tk.Tk):
         ttk.Button(control, text="Save output…", command=self.save_output).pack(
             side="left", padx=(6, 0)
         )
+        self.install_btn = ttk.Button(
+            control, text="Install / update tools", command=self.install_tools
+        )
+        self.install_btn.pack(side="left", padx=(6, 0))
 
         self.status_var = tk.StringVar(value="Idle.")
         ttk.Label(control, textvariable=self.status_var).pack(side="right")
@@ -170,7 +186,10 @@ class ScanLauncher(tk.Tk):
         return url
 
     def _busy(self) -> bool:
-        if self._proc is not None and self._proc.poll() is None:
+        if self._installing:
+            messagebox.showinfo("Busy", "Tools are installing. Please wait.")
+            return True
+        if self._scan_running or (self._proc is not None and self._proc.poll() is None):
             messagebox.showinfo("Busy", "A scan is already running. Stop it first.")
             return True
         return False
@@ -183,11 +202,12 @@ class ScanLauncher(tk.Tk):
         url = self._valid_target()
         if not url:
             return
-        if not shutil.which("nuclei"):
-            messagebox.showerror("Missing tool", "'nuclei' was not found on PATH.")
+        cmd = toolmanager.nuclei_cmd()
+        if cmd is None:
+            self._offer_install(["nuclei"])
             return
         # Standard templates: nuclei ships them and auto-updates on first run.
-        self._start(["nuclei", "-u", url], label="nuclei")
+        self._start(cmd + ["-u", url], label="nuclei")
 
     def run_nikto(self) -> None:
         if self._busy():
@@ -195,10 +215,11 @@ class ScanLauncher(tk.Tk):
         url = self._valid_target()
         if not url:
             return
-        if not shutil.which("nikto"):
-            messagebox.showerror("Missing tool", "'nikto' was not found on PATH.")
+        cmd = toolmanager.nikto_cmd()
+        if cmd is None:
+            self._offer_install(["nikto"])
             return
-        self._start(["nikto", "-h", url], label="nikto")
+        self._start(cmd + ["-h", url], label="nikto")
 
     def run_custom_script(self) -> None:
         if self._busy():
@@ -236,7 +257,8 @@ class ScanLauncher(tk.Tk):
     def _start(self, cmd: list[str], label: str) -> None:
         self._append(f"\n$ {' '.join(shlex.quote(c) for c in cmd)}\n")
         self.status_var.set(f"Running {label}…")
-        self._set_running(True)
+        self._scan_running = True
+        self._update_buttons()
 
         # Put the child in its own process group so Stop can kill the whole
         # tree. The mechanism differs between Windows and POSIX.
@@ -244,6 +266,7 @@ class ScanLauncher(tk.Tk):
             group_kwargs = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
         else:
             group_kwargs = {"start_new_session": True}
+        env = toolmanager.scan_env()  # locally installed tools on PATH
 
         def worker() -> None:
             try:
@@ -253,11 +276,12 @@ class ScanLauncher(tk.Tk):
                     stderr=subprocess.STDOUT,
                     text=True,
                     bufsize=1,
+                    env=env,
                     **group_kwargs,
                 )
             except OSError as exc:  # pragma: no cover - defensive
                 self._output_q.put(f"[error] could not start process: {exc}\n")
-                self._output_q.put(None)
+                self._output_q.put(_Signal("scan_done"))
                 return
 
             assert self._proc.stdout is not None
@@ -265,7 +289,7 @@ class ScanLauncher(tk.Tk):
                 self._output_q.put(line)
             self._proc.wait()
             self._output_q.put(f"\n[{label} finished, exit code {self._proc.returncode}]\n")
-            self._output_q.put(None)  # sentinel: scan done
+            self._output_q.put(_Signal("scan_done"))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -286,24 +310,82 @@ class ScanLauncher(tk.Tk):
             proc.terminate()
         self._append("\n[stop requested]\n")
 
+    # ------------------------------------------------------ tool install ---
+
+    def _autostart_install(self) -> None:
+        """On launch, offer to install any scanners that are missing."""
+        missing = toolmanager.missing_tools()
+        if missing:
+            self._offer_install(missing)
+
+    def _offer_install(self, tools: list[str]) -> None:
+        if self._installing or self._scan_running:
+            return
+        names = ", ".join(tools)
+        msg = (
+            f"These scanners were not found: {names}.\n\n"
+            f"Install them now into:\n{toolmanager.TOOLS_DIR}\n\n"
+            "• nuclei: official release binary from GitHub.\n"
+            "• nikto: source from GitHub (needs Perl installed to run).\n\n"
+            "This downloads files from the internet. Proceed?"
+        )
+        if messagebox.askyesno("Install scanners?", msg):
+            self._run_install(tools)
+
+    def install_tools(self) -> None:
+        """Manual button: (re)install both scanners."""
+        if self._busy():
+            return
+        self._run_install(["nuclei", "nikto"])
+
+    def _run_install(self, tools: list[str]) -> None:
+        self._installing = True
+        self._update_buttons()
+        self.status_var.set("Installing tools…")
+
+        def log(line: str) -> None:
+            self._output_q.put(line + "\n")
+
+        def worker() -> None:
+            for tool in tools:
+                installer = toolmanager.INSTALLERS.get(tool)
+                if installer is None:
+                    continue
+                log(f"\n=== Installing {tool} ===")
+                try:
+                    installer(log)
+                except Exception as exc:  # noqa: BLE001 - report any failure
+                    log(f"[error] {tool} install failed: {exc}")
+            self._output_q.put(_Signal("install_done"))
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def _poll_output_queue(self) -> None:
         try:
             while True:
                 item = self._output_q.get_nowait()
-                if item is None:
-                    self._set_running(False)
-                    self.status_var.set("Idle.")
+                if isinstance(item, _Signal):
+                    if item.kind == "scan_done":
+                        self._scan_running = False
+                        self.status_var.set("Idle.")
+                    elif item.kind == "install_done":
+                        self._installing = False
+                        self.status_var.set("Idle.")
+                        self._refresh_tool_status()
+                    self._update_buttons()
                 else:
                     self._append(item)
         except queue.Empty:
             pass
         self.after(100, self._poll_output_queue)
 
-    def _set_running(self, running: bool) -> None:
-        state = "disabled" if running else "normal"
-        for btn in (self.nuclei_btn, self.nikto_btn, self.custom_btn):
+    def _update_buttons(self) -> None:
+        """Enable/disable buttons based on scan + install state."""
+        idle = not self._scan_running and not self._installing
+        state = "normal" if idle else "disabled"
+        for btn in (self.nuclei_btn, self.nikto_btn, self.custom_btn, self.install_btn):
             btn.configure(state=state)
-        self.stop_btn.configure(state="normal" if running else "disabled")
+        self.stop_btn.configure(state="normal" if self._scan_running else "disabled")
 
     # -------------------------------------------------------- scripts UI ---
 
@@ -352,11 +434,17 @@ class ScanLauncher(tk.Tk):
             self.status_var.set(f"Saved to {path}")
 
     def _refresh_tool_status(self) -> None:
-        missing = [t for t in ("nuclei", "nikto") if not shutil.which(t)]
-        if missing:
+        nuclei = toolmanager.nuclei_cmd()
+        nikto = toolmanager.nikto_cmd()
+        self._append(
+            "[tools] "
+            f"nuclei: {'OK' if nuclei else 'missing'} | "
+            f"nikto: {'OK' if nikto else 'missing'}\n"
+        )
+        if not nuclei or not nikto:
             self._append(
-                f"[warning] not found on PATH: {', '.join(missing)}. "
-                "Install them to enable those scans.\n"
+                "[tools] Use 'Install / update tools' to download the missing "
+                "scanner(s) into the local tools folder.\n"
             )
 
 
