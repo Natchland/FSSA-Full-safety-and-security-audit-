@@ -50,6 +50,27 @@ py scan_launcher.py          # Windows
 Narrowing severity and/or tags makes scans much faster and quieter — useful
 against WAF/CDN-fronted hosts where the full 10k+ template set is overkill.
 
+## Session-authenticated auditing
+
+The **Custom Session Headers/Cookies** field lets you probe *authenticated*
+endpoints to verify access-control logic. Enter one item per line:
+
+```
+Authorization: Bearer <token>
+Cookie: session=abc; csrf=xyz
+```
+
+`Name: value` lines become request headers; bare `name=value` lines are
+collected into a `Cookie` header. When the field is populated, those headers are
+attached to **every dynamic probe** — the data-exposure scan, the security
+header audit, and the API schema validator (including the OpenAPI spec fetch) —
+and passed to **nuclei** via `-H`. Header values are **redacted** in the echoed
+nuclei command so tokens don't land in the log or saved report.
+
+> Implemented with the standard library (a shared header set applied to every
+> request, equivalent to a `requests.Session` with default headers) to keep the
+> tool dependency-free.
+
 ## Compliance & Data Exposure Audits (passive)
 
 Built-in, dependency-free checks that run in-process and stream into the same

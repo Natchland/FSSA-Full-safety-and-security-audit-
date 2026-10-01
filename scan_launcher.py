@@ -103,6 +103,41 @@ _NUCLEI_LINE_RE = re.compile(
 )
 
 
+def parse_auth_headers(text: str) -> dict:
+    """Parse the session-auth field into a headers dict.
+
+    Accepts one item per line (blank lines and #comments ignored):
+      - "Header-Name: value"  -> that header
+      - "name=value"          -> accumulated into a single Cookie header
+    So a session can be given as an Authorization header, a full
+    "Cookie: a=1; b=2" line, or individual "a=1" cookie pairs.
+    """
+    headers: dict[str, str] = {}
+    cookies: list[str] = []
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if ":" in line and not (line.count("=") and line.index("=") < line.index(":")):
+            name, value = line.split(":", 1)
+            headers[name.strip()] = value.strip()
+        elif "=" in line:
+            cookies.append(line)
+    if cookies:
+        existing = headers.get("Cookie")
+        joined = "; ".join(cookies)
+        headers["Cookie"] = f"{existing}; {joined}" if existing else joined
+    return headers
+
+
+def _merge_headers(extra: Optional[dict]) -> dict:
+    """Default UA merged with caller-supplied session headers (extra wins)."""
+    merged = dict(_UA)
+    if extra:
+        merged.update(extra)
+    return merged
+
+
 def parse_tool_line(source: str, line: str) -> Optional[dict]:
     """Turn a single nuclei/nikto output line into a finding dict, or None."""
     s = line.strip()
@@ -131,10 +166,11 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def _probe_path(base_url: str, path: str, timeout: float = 10.0) -> tuple:
+def _probe_path(base_url: str, path: str, timeout: float = 10.0,
+                extra_headers: Optional[dict] = None) -> tuple:
     """GET base_url+path (no redirects). Returns (path, status, size, error)."""
     url = urljoin(base_url, path)
-    req = urllib.request.Request(url, method="GET", headers=_UA)
+    req = urllib.request.Request(url, method="GET", headers=_merge_headers(extra_headers))
     opener = urllib.request.build_opener(_NoRedirect)
     try:
         with opener.open(req, timeout=timeout) as resp:
@@ -146,13 +182,16 @@ def _probe_path(base_url: str, path: str, timeout: float = 10.0) -> tuple:
         return path, None, 0, str(exc)
 
 
-def data_exposure_scan(base_url: str, log, cancel: threading.Event, record=None) -> None:
+def data_exposure_scan(base_url: str, log, cancel: threading.Event, record=None,
+                       extra_headers: Optional[dict] = None) -> None:
     """Flag sensitive paths that return 200 OK (exposed server files)."""
-    log(f"[data-exposure] probing {len(SENSITIVE_PATHS)} paths on {base_url}")
+    auth = " (authenticated)" if extra_headers else ""
+    log(f"[data-exposure] probing {len(SENSITIVE_PATHS)} paths on {base_url}{auth}")
     flagged = 0
     with ThreadPoolExecutor(max_workers=8) as pool:
         futures = {
-            pool.submit(_probe_path, base_url, p): p for p in SENSITIVE_PATHS
+            pool.submit(_probe_path, base_url, p, 10.0, extra_headers): p
+            for p in SENSITIVE_PATHS
         }
         for future in as_completed(futures):
             if cancel.is_set():
@@ -198,11 +237,12 @@ def _header_quality(name: str, value: str) -> str:
     return ""
 
 
-def security_header_audit(url: str, log, cancel: threading.Event, record=None) -> None:
+def security_header_audit(url: str, log, cancel: threading.Event, record=None,
+                          extra_headers: Optional[dict] = None) -> None:
     """Fetch the target and report presence/validity of protection headers."""
-    log(f"[headers] fetching {url}")
+    log(f"[headers] fetching {url}{' (authenticated)' if extra_headers else ''}")
     try:
-        req = urllib.request.Request(url, headers=_UA)
+        req = urllib.request.Request(url, headers=_merge_headers(extra_headers))
         with urllib.request.urlopen(req, timeout=15) as resp:
             headers = {k.lower(): v for k, v in resp.headers.items()}
             status = resp.status
@@ -320,7 +360,8 @@ def parse_api_routes(text: str) -> list[tuple[str, str]]:
     return routes
 
 
-def _load_openapi_routes(base_url: str, src: str) -> list[tuple[str, str]]:
+def _load_openapi_routes(base_url: str, src: str,
+                         extra_headers: Optional[dict] = None) -> list[tuple[str, str]]:
     """Load (METHOD, path) operations from an openapi.json URL or file path."""
     data = None
     if re.match(r"^https?://", src):
@@ -332,7 +373,7 @@ def _load_openapi_routes(base_url: str, src: str) -> list[tuple[str, str]]:
     else:
         url = urljoin(base_url, src)
     if data is None:
-        req = urllib.request.Request(url, headers=_UA)
+        req = urllib.request.Request(url, headers=_merge_headers(extra_headers))
         with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read().decode("utf-8", "replace"))
 
@@ -376,10 +417,11 @@ def _api_variants(method: str, path: str) -> list[tuple[str, str, Optional[str]]
     return variants
 
 
-def _send_api(method: str, url: str, body: Optional[str], timeout: float = 12.0):
+def _send_api(method: str, url: str, body: Optional[str], timeout: float = 12.0,
+              extra_headers: Optional[dict] = None):
     """Send one request; return (status, response_text) or (None, '__error__…')."""
     data = body.encode("utf-8") if body is not None else None
-    headers = dict(_UA)
+    headers = _merge_headers(extra_headers)
     if data is not None:
         headers["Content-Type"] = "application/json"
     req = urllib.request.Request(url, data=data, method=method, headers=headers)
@@ -417,18 +459,20 @@ def api_schema_validator(
     log,
     cancel: threading.Event,
     record=None,
+    extra_headers: Optional[dict] = None,
     max_endpoints: int = 25,
     max_requests: int = 300,
 ) -> None:
     """Fuzz API endpoints with type/JSON mutations; flag leaked errors."""
+    auth = " (authenticated)" if extra_headers else ""
     if routes:
         endpoints = routes
-        log(f"[api-fuzz] using {len(endpoints)} custom route(s)")
+        log(f"[api-fuzz] using {len(endpoints)} custom route(s){auth}")
     else:
         src = openapi_src or urljoin(base_url, "/openapi.json")
-        log(f"[api-fuzz] loading OpenAPI spec from {src}")
+        log(f"[api-fuzz] loading OpenAPI spec from {src}{auth}")
         try:
-            endpoints = _load_openapi_routes(base_url, src)
+            endpoints = _load_openapi_routes(base_url, src, extra_headers)
         except Exception as exc:  # noqa: BLE001
             log(f"[api-fuzz] could not load OpenAPI spec: {exc}")
             log("[api-fuzz] tip: provide custom routes instead, e.g. /api/v1/users/1")
@@ -450,7 +494,9 @@ def api_schema_validator(
         for desc, cpath, body in variants:
             if cancel.is_set() or sent >= max_requests:
                 break
-            status, resp = _send_api(method, urljoin(base_url, cpath), body)
+            status, resp = _send_api(
+                method, urljoin(base_url, cpath), body, extra_headers=extra_headers
+            )
             sent += 1
             if resp.startswith("__transport_error__"):
                 log(f"    [err ] [{desc}] -> {resp}")
@@ -599,6 +645,19 @@ class ScanLauncher(tk.Tk):
             text="I am authorized to scan this target.",
             variable=self.authorized_var,
         ).pack(anchor="w", padx=8)
+
+        # --- Session authentication (optional) ----------------------------
+        sess = ttk.LabelFrame(self, text="Custom Session Headers/Cookies (optional)")
+        sess.pack(fill="x", **pad)
+        self.auth_text = tk.Text(sess, height=3, width=50)
+        self.auth_text.pack(side="left", fill="x", expand=True, padx=6, pady=4)
+        ttk.Label(
+            sess,
+            justify="left",
+            text=("One per line, e.g.\nAuthorization: Bearer <token>\n"
+                  "Cookie: session=abc; csrf=xyz\n"
+                  "Applied to data-exposure, header &\nAPI probes (and nuclei via -H)."),
+        ).pack(side="left", padx=6, pady=4)
 
         # --- Scanner buttons ----------------------------------------------
         btns = ttk.LabelFrame(self, text="Scans")
@@ -790,6 +849,10 @@ class ScanLauncher(tk.Tk):
             return None
         return url
 
+    def _auth_headers(self) -> dict:
+        """Parse the session-auth field into a headers dict (empty if blank)."""
+        return parse_auth_headers(self.auth_text.get("1.0", "end"))
+
     def _busy(self) -> bool:
         if self._installing:
             messagebox.showinfo("Busy", "Tools are installing. Please wait.")
@@ -824,7 +887,15 @@ class ScanLauncher(tk.Tk):
             tags = ",".join(t.strip() for t in tags.split(",") if t.strip())
             args += ["-tags", tags]
 
-        self._start(args, label="nuclei", source="nuclei")
+        # Session auth: pass each header to nuclei via -H, and redact the
+        # values in the echoed command so tokens don't land in the log/report.
+        auth = self._auth_headers()
+        redactions = []
+        for name, value in auth.items():
+            args += ["-H", f"{name}: {value}"]
+            redactions.append(f"{name}: {value}")
+
+        self._start(args, label="nuclei", source="nuclei", redact=redactions)
 
     def run_nikto(self) -> None:
         if self._busy():
@@ -865,8 +936,11 @@ class ScanLauncher(tk.Tk):
         url = self._valid_target()
         if not url:
             return
+        auth = self._auth_headers()
         self._start_task(
-            lambda log, cancel: data_exposure_scan(url, log, cancel, record=self._record),
+            lambda log, cancel: data_exposure_scan(
+                url, log, cancel, record=self._record, extra_headers=auth
+            ),
             label="data exposure scan",
         )
 
@@ -876,8 +950,11 @@ class ScanLauncher(tk.Tk):
         url = self._valid_target()
         if not url:
             return
+        auth = self._auth_headers()
         self._start_task(
-            lambda log, cancel: security_header_audit(url, log, cancel, record=self._record),
+            lambda log, cancel: security_header_audit(
+                url, log, cancel, record=self._record, extra_headers=auth
+            ),
             label="security header audit",
         )
 
@@ -888,11 +965,13 @@ class ScanLauncher(tk.Tk):
         if not url:
             return
 
+        auth = self._auth_headers()
+
         def both(log, cancel) -> None:
-            security_header_audit(url, log, cancel, record=self._record)
+            security_header_audit(url, log, cancel, record=self._record, extra_headers=auth)
             if not cancel.is_set():
                 log("")
-                data_exposure_scan(url, log, cancel, record=self._record)
+                data_exposure_scan(url, log, cancel, record=self._record, extra_headers=auth)
 
         self._start_task(both, label="compliance audits")
 
@@ -905,9 +984,11 @@ class ScanLauncher(tk.Tk):
         openapi_src = self.openapi_var.get().strip() or None
         routes_text = self.routes_text.get("1.0", "end").strip()
         routes = parse_api_routes(routes_text) if routes_text else None
+        auth = self._auth_headers()
         self._start_task(
             lambda log, cancel: api_schema_validator(
-                url, openapi_src, routes, log, cancel, record=self._record
+                url, openapi_src, routes, log, cancel,
+                record=self._record, extra_headers=auth
             ),
             label="API schema validation",
         )
@@ -947,8 +1028,17 @@ class ScanLauncher(tk.Tk):
 
     # ---------------------------------------------- subprocess plumbing ---
 
-    def _start(self, cmd: list[str], label: str, source: str | None = None) -> None:
-        self._append(f"\n$ {' '.join(shlex.quote(c) for c in cmd)}\n")
+    def _start(self, cmd: list[str], label: str, source: str | None = None,
+               redact: list[str] | None = None) -> None:
+        echo = []
+        for c in cmd:
+            if redact and c in redact:
+                # Keep the header name, mask the value, in the echoed command.
+                name = c.split(":", 1)[0]
+                echo.append(shlex.quote(f"{name}: ***"))
+            else:
+                echo.append(shlex.quote(c))
+        self._append(f"\n$ {' '.join(echo)}\n")
         self.status_var.set(f"Running {label}…")
         self._scan_running = True
         self._cancel.clear()
