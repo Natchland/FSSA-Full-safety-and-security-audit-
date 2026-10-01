@@ -68,6 +68,28 @@ exploitation — and honor the authorization checkbox and the Stop button.
   including basic validity notes (e.g. HSTS `max-age=0`, CSP `unsafe-inline`).
 - **Run both audits** — runs the header audit then the data exposure scan.
 
+### Active API Schema Validator
+
+> ⚠️ **Active check.** Unlike the passive audits above, this sends *mutated*
+> requests to the target. Only run it against APIs you are authorized to test.
+
+Maps endpoints from the target's `openapi.json` (or a custom list of routes)
+and probes input handling by sending type-mutated and malformed payloads, then
+flags responses that leak **raw database errors** or **verbose stack traces** —
+a sign of improper input handling.
+
+- **Endpoint source:** give an **OpenAPI URL/path** (blank defaults to
+  `<target>/openapi.json`; a local file path also works), or a list of
+  **custom routes** (one per line or comma-separated, optional method), e.g.
+  `/api/v1/users/1` or `POST /api/v1/items`.
+- **Mutations:** path/parameter type changes (integer → string, SQL quote,
+  negative, overflow, null) and malformed/wrong-type JSON bodies (truncated
+  JSON, trailing comma, non-JSON, wrong root type, type-swapped fields).
+- **Detection:** flags `5xx` responses and bodies matching known DB-error or
+  stack-trace signatures, with the offending line shown.
+- **Bounded & cancellable:** capped at 25 endpoints / 300 requests by default,
+  and the Stop button cancels it mid-run.
+
 ## Automatic tool installation
 
 On launch, the app checks for `nuclei` and `nikto`. If either is missing it

@@ -15,6 +15,7 @@ so the window stays responsive while a scan is running.
 
 from __future__ import annotations
 
+import json
 import os
 import queue
 import re
@@ -28,7 +29,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urljoin, urlparse
+from urllib.parse import quote, urljoin, urlparse
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -187,6 +188,236 @@ def security_header_audit(url: str, log, cancel: threading.Event) -> None:
     log(f"[headers] gap analysis: {present}/{total} present, {total - present} missing.")
 
 
+# =====================================================================
+# Active API schema validator (input-handling / error-leakage fuzzer)
+# ---------------------------------------------------------------------
+# ACTIVE: sends mutated requests (type changes, malformed JSON) to API
+# endpoints and flags responses that leak raw DB errors or verbose stack
+# traces — a sign of improper input handling. Bounded by max_endpoints /
+# max_requests and cancellable via Stop. Authorized targets only.
+# =====================================================================
+
+_SEG_PARAM = re.compile(r"\{[^/}]+\}")  # OpenAPI path placeholder, e.g. {id}
+_BODY_METHODS = ("POST", "PUT", "PATCH")
+
+# Path/param type mutations — mainly integer -> other types.
+_PATH_PARAM_MUTATIONS = [
+    ("int->string", "FSSAstr"),
+    ("sql-quote", "1'"),
+    ("negative", "-1"),
+    ("overflow", "9" * 20),
+    ("null-word", "null"),
+]
+
+# Malformed / wrong-type JSON bodies for endpoints that accept a body.
+_MALFORMED_BODIES = [
+    ("truncated-json", '{"id": '),
+    ("trailing-comma", '{"id": 1,}'),
+    ("not-json", "this is not json"),
+    ("wrong-root-type", "[1, 2, 3]"),
+    ("type-swapped", '{"id": "not_a_number", "enabled": "maybe", "count": [1,2,3]}'),
+]
+
+# Signatures of leaked database errors.
+_DB_PATTERNS = [
+    r"you have an error in your sql syntax",
+    r"\bSQL syntax\b", r"\bSQLSTATE\b", r"ORA-\d{5}", r"\bPG::\w+",
+    r"\bpsql\b", r"postgresql", r"mysql_fetch", r"unclosed quotation mark",
+    r"sqlite3\.\w+", r"SQLiteException", r"MongoError", r"\bpymongo\b",
+    r"System\.Data\.SqlClient", r"org\.hibernate", r"\bJDBC\b",
+    r"SequelizeDatabaseError", r"psycopg2\.\w+",
+]
+
+# Signatures of verbose stack traces / debug error pages.
+_STACK_PATTERNS = [
+    r"Traceback \(most recent call last\)",
+    r'File ".*", line \d+',
+    r"\bat [\w.$]+\([\w.]+\.java:\d+\)",
+    r"Exception in thread",
+    r"NullPointerException", r"RuntimeException",
+    r"Werkzeug Debugger", r"werkzeug",
+    r"Whitelabel Error Page",
+    r"Fatal error:", r"Warning: .* on line \d+", r"Notice: .* on line \d+",
+    r"Microsoft OLE DB", r"ASP\.NET",
+    r"panic:", r"goroutine \d+ \[",
+    r"stack trace", r"\.rb:\d+:in ",
+]
+
+_COMPILED_SIGNATURES = (
+    [("db-error", re.compile(p, re.I)) for p in _DB_PATTERNS]
+    + [("stack-trace", re.compile(p, re.I)) for p in _STACK_PATTERNS]
+)
+
+
+def parse_api_routes(text: str) -> list[tuple[str, str]]:
+    """Parse the custom-routes box: comma/newline separated, optional method.
+
+    Examples: "/api/v1/users/1", "POST /api/v1/items".
+    """
+    routes: list[tuple[str, str]] = []
+    for chunk in re.split(r"[,\n]", text or ""):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        parts = chunk.split()
+        if len(parts) == 2 and parts[0].upper() in (
+            "GET", "POST", "PUT", "PATCH", "DELETE",
+        ):
+            routes.append((parts[0].upper(), parts[1]))
+        else:
+            routes.append(("GET", parts[-1]))
+    return routes
+
+
+def _load_openapi_routes(base_url: str, src: str) -> list[tuple[str, str]]:
+    """Load (METHOD, path) operations from an openapi.json URL or file path."""
+    data = None
+    if re.match(r"^https?://", src):
+        url = src
+    elif os.path.exists(src):
+        with open(src, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        url = None
+    else:
+        url = urljoin(base_url, src)
+    if data is None:
+        req = urllib.request.Request(url, headers=_UA)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+
+    routes: list[tuple[str, str]] = []
+    for path, item in (data.get("paths") or {}).items():
+        if not isinstance(item, dict):
+            continue
+        for method in ("get", "post", "put", "patch", "delete"):
+            if method in item:
+                routes.append((method.upper(), path))
+    return routes
+
+
+def _api_variants(method: str, path: str) -> list[tuple[str, str, Optional[str]]]:
+    """Build (description, concrete_path, body) request variants for an op."""
+    has_body = method in _BODY_METHODS
+    base = _SEG_PARAM.sub("1", path)  # fill placeholders with a sample value
+    default_body = "{}" if has_body else None
+    variants: list[tuple[str, str, Optional[str]]] = [("baseline", base, default_body)]
+
+    # Path-parameter type mutations (placeholder or numeric segment).
+    placeholders = _SEG_PARAM.findall(path)
+    if placeholders:
+        for desc, val in _PATH_PARAM_MUTATIONS:
+            mutated = path.replace(placeholders[0], quote(val, safe=""), 1)
+            mutated = _SEG_PARAM.sub("1", mutated)
+            variants.append((f"path/{desc}", mutated, default_body))
+    else:
+        segs = base.split("/")
+        idx = next((i for i, s in enumerate(segs) if s.isdigit()), None)
+        if idx is not None:
+            for desc, val in _PATH_PARAM_MUTATIONS:
+                seg = segs[:]
+                seg[idx] = quote(val, safe="")
+                variants.append((f"path/{desc}", "/".join(seg), default_body))
+
+    # Malformed / wrong-type JSON bodies.
+    if has_body:
+        for desc, body in _MALFORMED_BODIES:
+            variants.append((f"body/{desc}", base, body))
+    return variants
+
+
+def _send_api(method: str, url: str, body: Optional[str], timeout: float = 12.0):
+    """Send one request; return (status, response_text) or (None, '__error__…')."""
+    data = body.encode("utf-8") if body is not None else None
+    headers = dict(_UA)
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
+    opener = urllib.request.build_opener(_NoRedirect)
+    try:
+        with opener.open(req, timeout=timeout) as resp:
+            return resp.status, resp.read(8192).decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        text = ""
+        try:
+            text = exc.read(8192).decode("utf-8", "replace")  # error-page body
+        except Exception:  # noqa: BLE001
+            pass
+        return exc.code, text
+    except Exception as exc:  # noqa: BLE001 - transport failure
+        return None, f"__transport_error__: {exc}"
+
+
+def _scan_api_response(body: str) -> tuple[Optional[str], str]:
+    """Return (kind, matching_line) if a DB error / stack trace is leaked."""
+    for kind, rx in _COMPILED_SIGNATURES:
+        m = rx.search(body)
+        if m:
+            start = body.rfind("\n", 0, m.start()) + 1
+            end = body.find("\n", m.end())
+            end = len(body) if end < 0 else end
+            return kind, body[start:end].strip()[:200]
+    return None, ""
+
+
+def api_schema_validator(
+    base_url: str,
+    openapi_src: Optional[str],
+    routes: Optional[list[tuple[str, str]]],
+    log,
+    cancel: threading.Event,
+    max_endpoints: int = 25,
+    max_requests: int = 300,
+) -> None:
+    """Fuzz API endpoints with type/JSON mutations; flag leaked errors."""
+    if routes:
+        endpoints = routes
+        log(f"[api-fuzz] using {len(endpoints)} custom route(s)")
+    else:
+        src = openapi_src or urljoin(base_url, "/openapi.json")
+        log(f"[api-fuzz] loading OpenAPI spec from {src}")
+        try:
+            endpoints = _load_openapi_routes(base_url, src)
+        except Exception as exc:  # noqa: BLE001
+            log(f"[api-fuzz] could not load OpenAPI spec: {exc}")
+            log("[api-fuzz] tip: provide custom routes instead, e.g. /api/v1/users/1")
+            return
+        log(f"[api-fuzz] discovered {len(endpoints)} operation(s)")
+
+    if not endpoints:
+        log("[api-fuzz] no endpoints to test.")
+        return
+    endpoints = endpoints[:max_endpoints]
+
+    sent = 0
+    flagged = 0
+    for method, path in endpoints:
+        if cancel.is_set() or sent >= max_requests:
+            break
+        variants = _api_variants(method, path)
+        log(f"[api-fuzz] {method} {path} — {len(variants)} variant(s)")
+        for desc, cpath, body in variants:
+            if cancel.is_set() or sent >= max_requests:
+                break
+            status, resp = _send_api(method, urljoin(base_url, cpath), body)
+            sent += 1
+            if resp.startswith("__transport_error__"):
+                log(f"    [err ] [{desc}] -> {resp}")
+                continue
+            kind, line = _scan_api_response(resp)
+            is_5xx = status is not None and 500 <= status < 600
+            if kind or is_5xx:
+                flagged += 1
+                tag = kind or "server-error(5xx)"
+                log(f"    [WARN] [{desc}] -> {status}  LEAK: {tag}")
+                if line:
+                    log(f"           ↳ {line}")
+    if cancel.is_set():
+        log("[api-fuzz] cancelled.")
+    log(f"[api-fuzz] done — {sent} request(s) sent, {flagged} leaking response(s).")
+    if sent >= max_requests:
+        log(f"[api-fuzz] NOTE: stopped at the {max_requests}-request safety cap.")
+
+
 # Directory that holds your custom internal scripts. Override with the
 # FSSA_SCRIPTS_DIR environment variable if you keep them elsewhere.
 DEFAULT_SCRIPTS_DIR = Path(
@@ -304,6 +535,41 @@ class ScanLauncher(tk.Tk):
 
         for col in range(3):
             audit.columnconfigure(col, weight=1)
+
+        # --- Active API schema validator ----------------------------------
+        api = ttk.LabelFrame(
+            self, text="Active API Schema Validator (sends mutated requests)"
+        )
+        api.pack(fill="x", **pad)
+
+        ttk.Label(api, text="OpenAPI URL/path:").grid(
+            row=0, column=0, padx=6, pady=4, sticky="w"
+        )
+        self.openapi_var = tk.StringVar()
+        ttk.Entry(api, textvariable=self.openapi_var).grid(
+            row=0, column=1, sticky="ew", padx=6, pady=4
+        )
+        ttk.Label(api, text="blank = <target>/openapi.json").grid(
+            row=0, column=2, padx=6, pady=4, sticky="w"
+        )
+
+        ttk.Label(api, text="Custom routes:").grid(
+            row=1, column=0, padx=6, pady=4, sticky="nw"
+        )
+        self.routes_text = tk.Text(api, height=3, width=40)
+        self.routes_text.grid(row=1, column=1, sticky="ew", padx=6, pady=4)
+        ttk.Label(
+            api,
+            text="one per line or comma-sep,\noptional method, e.g.\nPOST /api/v1/users",
+            justify="left",
+        ).grid(row=1, column=2, padx=6, pady=4, sticky="w")
+
+        self.api_validate_btn = ttk.Button(
+            api, text="Validate API schema", command=self.run_api_validator
+        )
+        self.api_validate_btn.grid(row=2, column=1, sticky="w", padx=6, pady=6)
+
+        api.columnconfigure(1, weight=1)
 
         # --- Custom internal scripts --------------------------------------
         custom = ttk.LabelFrame(self, text="Custom internal scripts")
@@ -489,6 +755,22 @@ class ScanLauncher(tk.Tk):
 
         self._start_task(both, label="compliance audits")
 
+    def run_api_validator(self) -> None:
+        if self._busy():
+            return
+        url = self._valid_target()
+        if not url:
+            return
+        openapi_src = self.openapi_var.get().strip() or None
+        routes_text = self.routes_text.get("1.0", "end").strip()
+        routes = parse_api_routes(routes_text) if routes_text else None
+        self._start_task(
+            lambda log, cancel: api_schema_validator(
+                url, openapi_src, routes, log, cancel
+            ),
+            label="API schema validation",
+        )
+
     def _start_task(self, target, label: str) -> None:
         """Run a pure-Python check in a background thread, streaming via log."""
         self._append(f"\n=== {label} ===\n")
@@ -670,6 +952,7 @@ class ScanLauncher(tk.Tk):
             self.data_exposure_btn,
             self.header_audit_btn,
             self.audit_all_btn,
+            self.api_validate_btn,
         ):
             btn.configure(state=state)
         self.stop_btn.configure(state="normal" if self._scan_running else "disabled")
